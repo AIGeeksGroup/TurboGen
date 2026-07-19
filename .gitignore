@@ -66,12 +66,15 @@ venv.bak/
 *.model
 *.pk
 *.pkl
-checkpoints/
 weights/
 pretrained/
 models/*.safetensors
 models/*.pt
 models/*.pth
+
+# Keep repository-level checkpoints tracked when explicitly added.
+!checkpoints/
+!checkpoints/**
 
 # =============================================================================
 # Data Files (Large Files)
@@ -163,6 +166,10 @@ lightning_logs/
 *.rar
 *.gz
 *.bz2
+
+# Static project assets are committed even though media files are ignored by default.
+!static/
+!static/**
 
 # =============================================================================
 # OS Generated Files
