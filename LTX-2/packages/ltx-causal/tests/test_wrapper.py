@@ -116,12 +116,10 @@ class TestAudioVideoAlignment:
 
         blocks = compute_av_blocks(16, num_frame_per_block=3)
 
-        # 6 blocks total: 1 Global Prefix + 5 standard
-        assert len(blocks) == 6
+        assert len(blocks) == 5
 
-        # Global Prefix (V_0 + A_0)
-        assert blocks[0].video_frames == 1
-        assert blocks[0].audio_frames == 1
+        assert blocks[0].video_frames == 4
+        assert blocks[0].audio_frames == 26
 
         # Standard blocks
         for b in blocks[1:]:

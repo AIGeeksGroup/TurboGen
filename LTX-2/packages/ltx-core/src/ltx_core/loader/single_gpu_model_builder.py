@@ -69,10 +69,30 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         uninitialized_params = [name for name, param in meta_model.named_parameters() if str(param.device) == "meta"]
         uninitialized_buffers = [name for name, buffer in meta_model.named_buffers() if str(buffer.device) == "meta"]
         if uninitialized_params or uninitialized_buffers:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized_params + uninitialized_buffers}")
-            return meta_model
+            raise RuntimeError(
+                "Checkpoint did not initialize the complete model: "
+                f"{uninitialized_params + uninitialized_buffers}"
+            )
         retval = meta_model.to(device)
         return retval
+
+    @staticmethod
+    def _strict_assign(meta_model: ModelType, state_dict: dict[str, torch.Tensor], source: str) -> None:
+        incompatible = meta_model.load_state_dict(state_dict, strict=False, assign=True)
+        allowed_runtime_buffers: set[str] = set()
+        for module_name, module in meta_model.named_modules():
+            if getattr(module, "materialize_missing_buffers", None) is None:
+                continue
+            prefix = f"{module_name}." if module_name else ""
+            allowed_runtime_buffers.update(prefix + name for name, _buffer in module.named_buffers(recurse=False))
+
+        disallowed_missing = sorted(set(incompatible.missing_keys) - allowed_runtime_buffers)
+        unexpected = sorted(incompatible.unexpected_keys)
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                f"Strict checkpoint load failed for {source}: "
+                f"missing={disallowed_missing[:20]}, unexpected={unexpected[:20]}"
+            )
 
     def build(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> ModelType:
         device = torch.device("cuda") if device is None else device
@@ -86,7 +106,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             sd = model_state_dict.sd
             if dtype is not None:
                 sd = {key: value.to(dtype=dtype) for key, value in model_state_dict.sd.items()}
-            meta_model.load_state_dict(sd, strict=False, assign=True)
+            self._strict_assign(meta_model, sd, str(model_paths))
             return self._return_model(meta_model, device)
 
         lora_state_dicts = [
@@ -102,5 +122,5 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             dtype=dtype,
             destination_sd=model_state_dict if isinstance(self.registry, DummyRegistry) else None,
         )
-        meta_model.load_state_dict(final_sd.sd, strict=False, assign=True)
+        self._strict_assign(meta_model, final_sd.sd, f"LoRA merge from {model_paths}")
         return self._return_model(meta_model, device)

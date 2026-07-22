@@ -1,16 +1,21 @@
 # =============================================================================
 # Stage 1: Bidirectional DMD Distillation
 # =============================================================================
-# Distills LTX-2 teacher (1000-step) into a fast 4-step bidirectional model.
+# Distills the LTX-2.3 FP8 teacher into a fast 4-step bidirectional model.
 # This model serves as the teacher and critic for later causal stages.
 #
 # CFG: video=3.0, audio=5.0
 
 # =============================================================================
-# Model Paths (UPDATE THESE TO YOUR LOCAL PATHS)
+# Model Paths
 # =============================================================================
-checkpoint_path: /path/to/checkpoints/ltx-2-19b-dev.safetensors
-gemma_path: /path/to/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
+checkpoint_path: ../../../checkpoints/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors
+gemma_path: ../../../checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
+training_stage: stage1_bidirectional_dmd
+resume_checkpoint: null
+require_ltx23_architecture: true
+teacher_fp8_mode: static
+trainable_fp8_mode: training
 
 # =============================================================================
 # Model Configuration
@@ -29,8 +34,9 @@ fake_score_grad:
 # =============================================================================
 denoising_step_list:
   - 1000
-  - 757
-  - 522
+  - 909
+  - 725
+  - 421
   - 0
 
 num_train_timestep: 1000
@@ -50,6 +56,8 @@ distillation_loss: dmd
 # =============================================================================
 mixed_precision: true
 gradient_checkpointing: true
+expected_world_size: 8
+fsdp_wrap_during_model_init: true
 batch_size: 1
 
 lr: 2.0e-05
@@ -63,14 +71,14 @@ dfake_gen_update_ratio: 5
 max_grad_norm: 3.0
 
 scheduler_type: constant
-# max_steps: 20000
+max_steps: 20000
 
 # =============================================================================
 # Data Configuration
 # =============================================================================
 # Path to text prompts file (one prompt per line).
 # Generate enhanced prompts using: LTX-2/packages/pe/batch_enhance.py
-data_path: /path/to/data/prompts.txt
+data_path: ./prompts/benchmark_512.txt
 backward_simulation: true
 
 negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
@@ -96,12 +104,25 @@ text_encoder_fsdp_wrap_strategy: size
 # Logging and Checkpointing
 # =============================================================================
 output_path: ./outputs/stage1_bidirectional_dmd
-log_iters: 200
+log_iters: 10
+save_iters: 500
 
 wandb_project: OmniForcing
-wandb_entity: your-wandb-entity
+wandb_entity: OmniForcing1
 wandb_name: stage1_bidirectional_dmd
 # wandb_api_key: "your-wandb-api-key"
+wandb_api_key_file: ../../../.wandb_key
+wandb_video_required: true
+
+# Upload every completed checkpoint directory (model weights and resume state).
+hf_upload_repo_id: aaachier/OmniForcing-backup
+hf_upload_token_file: ../../../.hf_token
+hf_upload_repo_type: model
+hf_upload_path_prefix: step1_ltx23
+hf_upload_create_repo: true
+hf_upload_blocking: true
+hf_upload_required: true
+hf_upload_benchmark: false
 
 seed: 42
 
@@ -109,8 +130,9 @@ seed: 42
 # Benchmark
 # =============================================================================
 benchmark_enabled: true
-benchmark_iters: 50
+benchmark_iters: 500
+benchmark_prompt_file: ./prompts/benchmark_8.txt
 benchmark_num_prompts: 8
 benchmark_seed: 12345
 benchmark_video_fps: 24
-benchmark_audio_sample_rate: 24000
+benchmark_audio_sample_rate: 48000

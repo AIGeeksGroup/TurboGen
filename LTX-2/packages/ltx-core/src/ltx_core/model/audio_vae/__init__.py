@@ -10,7 +10,7 @@ from ltx_core.model.audio_vae.model_configurator import (
     VocoderConfigurator,
 )
 from ltx_core.model.audio_vae.ops import AudioProcessor
-from ltx_core.model.audio_vae.vocoder import Vocoder
+from ltx_core.model.audio_vae.vocoder import MelSTFT, Vocoder, VocoderWithBWE
 
 __all__ = [
     "AUDIO_VAE_DECODER_COMFY_KEYS_FILTER",
@@ -22,6 +22,8 @@ __all__ = [
     "AudioEncoderConfigurator",
     "AudioProcessor",
     "Vocoder",
+    "VocoderWithBWE",
+    "MelSTFT",
     "VocoderConfigurator",
     "decode_audio",
 ]

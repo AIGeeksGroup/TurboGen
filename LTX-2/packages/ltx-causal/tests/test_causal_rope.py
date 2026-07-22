@@ -5,8 +5,15 @@ Tests the current implementation which matches ltx-core exactly,
 with causal frame offset support for future real-time inference.
 """
 
-import pytest
 import torch
+
+from ltx_core.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
+from ltx_core.model.transformer.rope import (
+    LTXRopeType,
+    generate_freq_grid_np,
+    precompute_freqs_cis,
+)
+from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
 
 from ltx_causal.rope.causal_rope import (
     causal_precompute_freqs_cis,
@@ -92,17 +99,60 @@ class TestCausalPrecomputeFreqsCis:
         # Different start frames should produce different frequencies
         assert not torch.allclose(cos_0, cos_5)
 
-    def test_split_mode_raises(self):
-        """SPLIT mode should raise ValueError."""
+    def test_ltx23_split_rope_exactly_matches_core(self):
+        shape = VideoLatentShape(batch=1, channels=128, frames=2, height=2, width=2)
+        bounds = VideoLatentPatchifier(patch_size=1).get_patch_grid_bounds(
+            output_shape=shape,
+            device=torch.device("cpu"),
+        )
+        positions = get_pixel_coords(
+            latent_coords=bounds,
+            scale_factors=SpatioTemporalScaleFactors.default(),
+            causal_fix=True,
+        ).float()
+        positions[:, 0] /= 24.0
+
+        expected = precompute_freqs_cis(
+            positions,
+            dim=4096,
+            out_dtype=torch.float32,
+            theta=10000.0,
+            max_pos=[20, 2048, 2048],
+            use_middle_indices_grid=True,
+            num_attention_heads=32,
+            rope_type=LTXRopeType.SPLIT,
+            freq_grid_generator=generate_freq_grid_np,
+        )
+        actual = causal_precompute_freqs_cis(
+            torch.tensor([[2, 2, 2]]),
+            dim=4096,
+            theta=10000.0,
+            max_pos=[20, 2048, 2048],
+            rope_type=CausalRopeType.SPLIT,
+            num_attention_heads=32,
+            device="cpu",
+            dtype=torch.float32,
+            double_precision=True,
+        )
+
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(actual[1], expected[1])
+
+    def test_split_mode_output_shape(self):
+        """LTX-2.3 split RoPE is laid out per attention head."""
         grid_sizes = torch.tensor([[4, 4, 4]])
         dim = 128
 
-        with pytest.raises(ValueError, match="Only CausalRopeType.INTERLEAVED"):
-            causal_precompute_freqs_cis(
-                grid_sizes=grid_sizes, dim=dim,
-                rope_type=CausalRopeType.SPLIT,
-                device='cpu',
-            )
+        cos_freq, sin_freq = causal_precompute_freqs_cis(
+            grid_sizes=grid_sizes,
+            dim=dim,
+            rope_type=CausalRopeType.SPLIT,
+            num_attention_heads=4,
+            device='cpu',
+        )
+
+        assert cos_freq.shape == (1, 4, 64, 16)
+        assert sin_freq.shape == cos_freq.shape
 
 
 class TestApplyInterleavedRotaryEmb:

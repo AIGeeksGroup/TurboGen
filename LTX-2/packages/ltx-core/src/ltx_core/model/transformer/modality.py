@@ -14,6 +14,7 @@ class Modality:
     latent: (
         torch.Tensor
     )  # Shape: (B, T, D) where B is the batch size, T is the number of tokens, and D is input dimension
+    sigma: torch.Tensor  # Shape: (B,), current modality noise level.
     timesteps: torch.Tensor  # Shape: (B, T) where T is the number of timesteps
     positions: (
         torch.Tensor
@@ -21,3 +22,4 @@ class Modality:
     context: torch.Tensor
     enabled: bool = True
     context_mask: torch.Tensor | None = None
+    attention_mask: torch.Tensor | None = None

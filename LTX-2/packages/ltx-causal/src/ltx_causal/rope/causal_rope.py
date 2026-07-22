@@ -48,6 +48,7 @@ def generate_freq_grid(
     max_pos_count: int,
     inner_dim: int,
     device: Union[torch.device, str] = "cuda",
+    double_precision: bool = False,
 ) -> torch.Tensor:
     """
     Generate frequency grid for RoPE.
@@ -63,6 +64,11 @@ def generate_freq_grid(
     Returns:
         Frequency indices tensor
     """
+    if double_precision:
+        from ltx_core.model.transformer.rope import generate_freq_grid_np
+
+        return generate_freq_grid_np(theta, max_pos_count, inner_dim).to(device=device)
+
     start = 1
     end = theta
     n_elem = 2 * max_pos_count
@@ -111,9 +117,11 @@ def causal_precompute_freqs_cis(
     max_pos: Optional[List[int]] = None,
     start_frame: int = 0,
     rope_type: CausalRopeType = CausalRopeType.INTERLEAVED,
+    num_attention_heads: int = 32,
     device: Union[torch.device, str] = "cuda",
     dtype: torch.dtype = torch.float32,
     is_audio: bool = False,
+    double_precision: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Precompute RoPE frequencies with causal frame offset.
@@ -157,7 +165,13 @@ def causal_precompute_freqs_cis(
     num_pos_dims = grid_sizes.shape[1]
 
     # Generate frequency indices
-    indices = generate_freq_grid(theta, num_pos_dims, dim, device)
+    indices = generate_freq_grid(
+        theta,
+        num_pos_dims,
+        dim,
+        device,
+        double_precision=double_precision,
+    )
 
     # Build position indices with frame offset
     all_freqs = []
@@ -231,15 +245,43 @@ def causal_precompute_freqs_cis(
     # Stack batches
     freqs = torch.stack(all_freqs, dim=0)  # [B, seq_len, D_freq * num_pos_dims]
 
-    # Only INTERLEAVED mode is supported. SPLIT mode produces incorrect tensor
-    # shapes (3D vs original's 4D after head reshape) and has never been tested.
-    if rope_type != CausalRopeType.INTERLEAVED:
-        raise ValueError(
-            f"Only CausalRopeType.INTERLEAVED is supported, got {rope_type}. "
-            f"SPLIT mode is not implemented correctly for causal generation."
-        )
+    if rope_type == CausalRopeType.SPLIT:
+        # The current LTX-2.3 checkpoints use split RoPE.  Unlike legacy
+        # interleaved RoPE, its frequencies are laid out per attention head:
+        # [batch, heads, tokens, head_dim // 2].
+        expected_freqs = dim // 2
+        current_freqs = freqs.shape[-1]
+        pad_size = expected_freqs - current_freqs
+        if pad_size < 0:
+            raise ValueError(
+                f"Split RoPE produced {current_freqs} frequencies for dimension {dim}; "
+                "the checkpoint/model head configuration is inconsistent."
+            )
+        if pad_size:
+            cos_freq = freqs.cos()
+            sin_freq = freqs.sin()
+            cos_padding = torch.ones_like(cos_freq[..., :pad_size])
+            sin_padding = torch.zeros_like(sin_freq[..., :pad_size])
+            cos_freq = torch.cat([cos_padding, cos_freq], dim=-1)
+            sin_freq = torch.cat([sin_padding, sin_freq], dim=-1)
+        else:
+            cos_freq = freqs.cos()
+            sin_freq = freqs.sin()
 
-    # Compute cos/sin with padding matching original interleaved_freqs_cis
+        if expected_freqs % num_attention_heads != 0:
+            raise ValueError(
+                f"RoPE dimension {expected_freqs} is not divisible by "
+                f"num_attention_heads={num_attention_heads}."
+            )
+        head_dim_half = expected_freqs // num_attention_heads
+        cos_freq = cos_freq.reshape(cos_freq.shape[0], cos_freq.shape[1], num_attention_heads, head_dim_half)
+        sin_freq = sin_freq.reshape(sin_freq.shape[0], sin_freq.shape[1], num_attention_heads, head_dim_half)
+        return cos_freq.transpose(1, 2).to(dtype), sin_freq.transpose(1, 2).to(dtype)
+
+    if rope_type != CausalRopeType.INTERLEAVED:
+        raise ValueError(f"Unsupported causal RoPE type: {rope_type}")
+
+    # Compute cos/sin with padding matching original interleaved_freqs_cis.
     cos_freq = freqs.cos().repeat_interleave(2, dim=-1)
     sin_freq = freqs.sin().repeat_interleave(2, dim=-1)
 

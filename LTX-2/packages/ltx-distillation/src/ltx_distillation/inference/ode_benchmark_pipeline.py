@@ -6,6 +6,10 @@ Each block is generated with a prefix rerun strategy:
 - previous blocks stay fixed at sigma=0 (clean causal context)
 - the current block follows the multi-step denoising schedule
 - only the current block is updated after each denoising step
+
+The default Euler transition matches both ODE-pair generation and the official
+LTX sampling pipelines. The legacy fresh-noise transition remains available for
+controlled comparisons.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -17,6 +21,7 @@ from ltx_causal.attention.mask_builder import (
     compute_aligned_audio_frames,
     compute_av_blocks,
 )
+from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_distillation.inference.bidirectional_pipeline import BidirectionalAVInferencePipeline
 
 
@@ -31,10 +36,18 @@ class ODEAutoregressiveBenchmarkPipeline:
         num_frame_per_block: int = 3,
         num_frame_per_block_first: int = 4,
         clear_cuda_cache_per_round: bool = True,
+        transition_mode: str = "euler",
+        use_bidirectional_bootstrap: bool = False,
+        log_step_stats: bool = False,
     ):
         if denoising_sigmas.ndim != 1 or denoising_sigmas.numel() < 2:
             raise ValueError(
                 "denoising_sigmas must be a 1D tensor with at least 2 entries"
+            )
+
+        if transition_mode not in {"euler", "renoise"}:
+            raise ValueError(
+                f"transition_mode must be 'euler' or 'renoise', got {transition_mode!r}"
             )
 
         self.generator = generator
@@ -43,6 +56,10 @@ class ODEAutoregressiveBenchmarkPipeline:
         self.num_frame_per_block = max(1, int(num_frame_per_block))
         self.num_frame_per_block_first = max(1, int(num_frame_per_block_first))
         self.clear_cuda_cache_per_round = bool(clear_cuda_cache_per_round)
+        self.transition_mode = transition_mode
+        self.use_bidirectional_bootstrap = bool(use_bidirectional_bootstrap)
+        self.log_step_stats = bool(log_step_stats)
+        self.euler_step = EulerDiffusionStep()
 
     def _get_bootstrap_generator(self) -> nn.Module:
         get_delegate = getattr(self.generator, "_get_bidirectional_delegate", None)
@@ -101,6 +118,47 @@ class ODEAutoregressiveBenchmarkPipeline:
             clean_block,
             torch.randn_like(clean_block),
             sigma,
+        )
+
+    def _advance_block(
+        self,
+        sample: torch.Tensor,
+        denoised_sample: torch.Tensor,
+        step_index: int,
+    ) -> torch.Tensor:
+        if self.transition_mode == "euler":
+            return self.euler_step.step(
+                sample=sample,
+                denoised_sample=denoised_sample,
+                sigmas=self.denoising_sigmas,
+                step_index=step_index,
+            )
+
+        next_sigma = self.denoising_sigmas[step_index + 1]
+        if float(next_sigma.item()) > 0.0:
+            return self._renoise_block(denoised_sample, next_sigma)
+        return denoised_sample
+
+    def _log_step(
+        self,
+        block_index: int,
+        step_index: int,
+        sigma: torch.Tensor,
+        sample: torch.Tensor,
+        denoised_sample: torch.Tensor,
+    ) -> None:
+        if not self.log_step_stats:
+            return
+        sample_float = sample.detach().float()
+        denoised_float = denoised_sample.detach().float()
+        print(
+            f"[step2] block={block_index} step={step_index} "
+            f"sigma={float(sigma.item()):.6f} "
+            f"input_mean={sample_float.mean().item():.4f} "
+            f"input_std={sample_float.std().item():.4f} "
+            f"x0_mean={denoised_float.mean().item():.4f} "
+            f"x0_std={denoised_float.std().item():.4f}",
+            flush=True,
         )
 
     @staticmethod
@@ -162,7 +220,7 @@ class ODEAutoregressiveBenchmarkPipeline:
             audio = torch.zeros(audio_shape, device=device, dtype=dtype)
 
         for block in blocks:
-            if block.block_idx == 0:
+            if block.block_idx == 0 and self.use_bidirectional_bootstrap:
                 bootstrap_generator = self._get_bootstrap_generator()
                 try:
                     bootstrap_pipeline = BidirectionalAVInferencePipeline(
@@ -204,6 +262,8 @@ class ODEAutoregressiveBenchmarkPipeline:
             prev_audio = audio[:, :block.audio_start] if audio is not None else None
 
             for sigma_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+                model_input_video = current_video
+                model_input_audio = current_audio
                 prefix_video = torch.cat([prev_video, current_video], dim=1)
                 video_sigma = torch.cat(
                     [
@@ -243,11 +303,24 @@ class ODEAutoregressiveBenchmarkPipeline:
                         )
                     current_audio = pred_audio_prefix[:, block.audio_start:block.audio_end]
 
-                next_sigma = self.denoising_sigmas[sigma_idx + 1]
-                if float(next_sigma.item()) > 0.0:
-                    current_video = self._renoise_block(current_video, next_sigma)
-                    if current_audio is not None:
-                        current_audio = self._renoise_block(current_audio, next_sigma)
+                self._log_step(
+                    block_index=block.block_idx,
+                    step_index=sigma_idx,
+                    sigma=sigma,
+                    sample=model_input_video,
+                    denoised_sample=current_video,
+                )
+                current_video = self._advance_block(
+                    sample=model_input_video,
+                    denoised_sample=current_video,
+                    step_index=sigma_idx,
+                )
+                if current_audio is not None:
+                    current_audio = self._advance_block(
+                        sample=model_input_audio,
+                        denoised_sample=current_audio,
+                        step_index=sigma_idx,
+                    )
 
                 if self.clear_cuda_cache_per_round:
                     torch.cuda.empty_cache()

@@ -63,11 +63,9 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
-            use_caption_projection=not (
-                config.get("caption_proj_before_connector", False)
-                and not config.get("caption_projection_first_linear", True)
-                and not config.get("caption_projection_second_linear", True)
-            ),
+            use_caption_projection=not config.get("caption_proj_before_connector", False),
+            apply_gated_attention=config.get("apply_gated_attention", False),
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
         )
 
 
@@ -114,11 +112,9 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             use_middle_indices_grid=config.get("use_middle_indices_grid", True),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
-            use_caption_projection=not (
-                config.get("caption_proj_before_connector", False)
-                and not config.get("caption_projection_first_linear", True)
-                and not config.get("caption_projection_second_linear", True)
-            ),
+            use_caption_projection=not config.get("caption_proj_before_connector", False),
+            apply_gated_attention=config.get("apply_gated_attention", False),
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
         )
 
 
@@ -127,29 +123,6 @@ def _naive_weight_or_bias_downcast(key: str, value: torch.Tensor) -> list[KeyVal
     Downcast the weight or bias to the float8_e4m3fn dtype.
     """
     return [KeyValueOperationResult(key, value.to(dtype=torch.float8_e4m3fn))]
-
-
-def _ltx23_scale_shift_table_to_legacy(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-    """Adapt LTX-2.3 9-row AdaLN tables to the 6-row block implementation.
-
-    LTX-2.3 checkpoints store three extra rows in per-block scale_shift_table
-    tensors. This code path only consumes the first three self-attention rows
-    and the last three feed-forward rows, so keep rows [0:3] and [6:9].
-    """
-    if value.ndim == 2 and value.shape[0] == 9:
-        value = torch.cat([value[:3], value[6:]], dim=0)
-    return [KeyValueOperationResult(key, value)]
-
-
-def _ltx23_adaln_linear_to_legacy(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-    """Adapt LTX-2.3 9-way AdaLN linear outputs to the 6-way implementation."""
-    if value.ndim == 2 and value.shape[0] % 9 == 0:
-        dim = value.shape[0] // 9
-        value = torch.cat([value[: 3 * dim], value[6 * dim :]], dim=0)
-    elif value.ndim == 1 and value.shape[0] % 9 == 0:
-        dim = value.shape[0] // 9
-        value = torch.cat([value[: 3 * dim], value[6 * dim :]], dim=0)
-    return [KeyValueOperationResult(key, value)]
 
 
 def _upcast_and_round(
@@ -200,46 +173,38 @@ def amend_forward_with_upcast(
     return model
 
 
-LTXV_MODEL_COMFY_RENAMING_MAP = (
-    SDOps("LTXV_MODEL_COMFY_PREFIX_MAP")
-    .with_matching(prefix="model.diffusion_model.")
-    .with_replacement("model.diffusion_model.", "")
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix="scale_shift_table", operation=_ltx23_scale_shift_table_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="adaln_single.", key_suffix=".weight", operation=_ltx23_adaln_linear_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="adaln_single.", key_suffix=".bias", operation=_ltx23_adaln_linear_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="audio_adaln_single.", key_suffix=".weight", operation=_ltx23_adaln_linear_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="audio_adaln_single.", key_suffix=".bias", operation=_ltx23_adaln_linear_to_legacy
-    )
+_LTXV_TRANSFORMER_MODULES = (
+    "adaln_single",
+    "audio_adaln_single",
+    "audio_caption_projection",
+    "audio_patchify_proj",
+    "audio_proj_out",
+    "audio_prompt_adaln_single",
+    "audio_scale_shift_table",
+    "av_ca_a2v_gate_adaln_single",
+    "av_ca_audio_scale_shift_adaln_single",
+    "av_ca_v2a_gate_adaln_single",
+    "av_ca_video_scale_shift_adaln_single",
+    "caption_projection",
+    "patchify_proj",
+    "proj_out",
+    "prompt_adaln_single",
+    "scale_shift_table",
+    "transformer_blocks",
 )
 
+
+def _ltxv_transformer_sd_ops(name: str) -> SDOps:
+    ops = SDOps(name)
+    for module_name in _LTXV_TRANSFORMER_MODULES:
+        ops = ops.with_matching(prefix=f"model.diffusion_model.{module_name}")
+    return ops.with_replacement("model.diffusion_model.", "")
+
+
+LTXV_MODEL_COMFY_RENAMING_MAP = _ltxv_transformer_sd_ops("LTXV_MODEL_COMFY_PREFIX_MAP")
+
 LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP = (
-    SDOps("LTXV_MODEL_COMFY_PREFIX_MAP")
-    .with_matching(prefix="model.diffusion_model.")
-    .with_replacement("model.diffusion_model.", "")
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix="scale_shift_table", operation=_ltx23_scale_shift_table_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="adaln_single.", key_suffix=".weight", operation=_ltx23_adaln_linear_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="adaln_single.", key_suffix=".bias", operation=_ltx23_adaln_linear_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="audio_adaln_single.", key_suffix=".weight", operation=_ltx23_adaln_linear_to_legacy
-    )
-    .with_kv_operation(
-        key_prefix="audio_adaln_single.", key_suffix=".bias", operation=_ltx23_adaln_linear_to_legacy
-    )
+    _ltxv_transformer_sd_ops("LTXV_MODEL_COMFY_FP8_PREFIX_MAP")
     .with_kv_operation(
         key_prefix="transformer_blocks.", key_suffix=".to_q.weight", operation=_naive_weight_or_bias_downcast
     )

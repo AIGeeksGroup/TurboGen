@@ -42,6 +42,8 @@ class TransformerConfig:
     heads: int
     d_head: int
     context_dim: int  # Text context dimension
+    apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
 
 
 @dataclass
@@ -60,6 +62,7 @@ class CausalTransformerArgs:
     cross_positional_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     cross_scale_shift_timestep: Optional[torch.Tensor] = None
     cross_gate_timestep: Optional[torch.Tensor] = None
+    prompt_timestep: Optional[torch.Tensor] = None
 
     # Causal masks (training only)
     block_mask: Optional["BlockMask"] = None  # For self-attention
@@ -147,7 +150,7 @@ class CausalAVTransformerBlock(nn.Module):
         self.norm_eps = norm_eps
 
         # Diagnostic: when True, forward() collects gate/scale stats into _gate_stats
-        self._store_gate_stats = True
+        self._store_gate_stats = False
         self._gate_stats = {}
 
         # Curriculum learning: skip A2V/V2A cross-modal attention
@@ -163,6 +166,7 @@ class CausalAVTransformerBlock(nn.Module):
                 dim_head=video.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=video.apply_gated_attention,
             )
 
             # Video-text cross-attention (NON-CAUSAL - text is fixed, no temperature)
@@ -173,13 +177,16 @@ class CausalAVTransformerBlock(nn.Module):
                 dim_head=video.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=video.apply_gated_attention,
             )
 
             # Video feed-forward
             self.ff = FeedForward(video.dim, dim_out=video.dim)
 
-            # AdaLN parameters (6 values: shift/scale/gate for MSA and MLP)
-            self.scale_shift_table = nn.Parameter(torch.empty(6, video.dim))
+            video_adaln_values = 9 if video.cross_attention_adaln else 6
+            self.scale_shift_table = nn.Parameter(torch.empty(video_adaln_values, video.dim))
+            if video.cross_attention_adaln:
+                self.prompt_scale_shift_table = nn.Parameter(torch.empty(2, video.dim))
 
         # === Audio Branch ===
         if audio is not None:
@@ -191,6 +198,7 @@ class CausalAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=audio.apply_gated_attention,
             )
 
             # Audio-text cross-attention (NON-CAUSAL, no temperature)
@@ -201,13 +209,16 @@ class CausalAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=audio.apply_gated_attention,
             )
 
             # Audio feed-forward
             self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
 
-            # AdaLN parameters
-            self.audio_scale_shift_table = nn.Parameter(torch.empty(6, audio.dim))
+            audio_adaln_values = 9 if audio.cross_attention_adaln else 6
+            self.audio_scale_shift_table = nn.Parameter(torch.empty(audio_adaln_values, audio.dim))
+            if audio.cross_attention_adaln:
+                self.audio_prompt_scale_shift_table = nn.Parameter(torch.empty(2, audio.dim))
 
         # === Cross-Modal Attention (A2V and V2A) ===
         if audio is not None and video is not None:
@@ -219,6 +230,7 @@ class CausalAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=video.apply_gated_attention,
             )
 
             # Video-to-Audio: Q=Audio, K/V=Video (CAUSAL with timestamp mask + temperature)
@@ -229,11 +241,17 @@ class CausalAVTransformerBlock(nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=audio.apply_gated_attention,
             )
 
             # AdaLN for cross-attention (5 values: 4 scale/shift + 1 gate)
             self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, audio.dim))
             self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, video.dim))
+
+        self.cross_attention_adaln = (
+            (video is not None and video.cross_attention_adaln)
+            or (audio is not None and audio.cross_attention_adaln)
+        )
 
     def get_ada_values(
         self,
@@ -283,6 +301,52 @@ class CausalAVTransformerBlock(nn.Module):
         gate_ada_values = [t.squeeze(2) for t in gate_ada_values]
 
         return (*scale_shift_chunks, *gate_ada_values)
+
+    def _apply_text_cross_attention(
+        self,
+        x_normed: torch.Tensor,
+        context: torch.Tensor,
+        attention: CausalLTXAttention,
+        scale_shift_table: torch.Tensor,
+        prompt_scale_shift_table: Optional[torch.Tensor],
+        timestep: torch.Tensor,
+        prompt_timestep: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor],
+        crossattn_cache: Optional[Dict[str, Any]],
+    ) -> torch.Tensor:
+        """Apply legacy or LTX-2.3 AdaLN text cross-attention."""
+        if not self.cross_attention_adaln:
+            return attention(
+                x_normed,
+                context=context,
+                mask=context_mask,
+                crossattn_cache=crossattn_cache,
+            )
+        if prompt_scale_shift_table is None or prompt_timestep is None:
+            raise RuntimeError(
+                "cross_attention_adaln requires prompt AdaLN parameters and a prompt timestep"
+            )
+
+        q_shift, q_scale, q_gate = self.get_ada_values(
+            scale_shift_table,
+            x_normed.shape[0],
+            timestep,
+            slice(6, 9),
+        )
+        prompt_values = (
+            prompt_scale_shift_table[None, None].to(device=x_normed.device, dtype=x_normed.dtype)
+            + prompt_timestep.reshape(prompt_timestep.shape[0], prompt_timestep.shape[1], 2, -1)
+        )
+        kv_shift, kv_scale = prompt_values.unbind(dim=2)
+        context = context * (1 + kv_scale) + kv_shift
+        # The modulated text context changes with sigma, so a one-shot K/V
+        # cache would be stale across denoising steps.
+        output = attention(
+            x_normed * (1 + q_scale) + q_shift,
+            context=context,
+            mask=context_mask,
+        )
+        return output * q_gate
 
     def _record_grad(self, name: str, grad: torch.Tensor):
         """Record gradient norm for diagnostics (called by tensor hooks)."""
@@ -356,11 +420,16 @@ class CausalAVTransformerBlock(nn.Module):
 
             # Video-text cross-attention (non-causal). Reuses crossattn cache
             # across denoising steps and rollout blocks when provided.
-            vx_text_attn = self.attn2(
+            vx_text_attn = self._apply_text_cross_attention(
                 rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
-                mask=video.context_mask,
-                crossattn_cache=video.crossattn_cache_text,
+                video.context,
+                self.attn2,
+                self.scale_shift_table,
+                getattr(self, "prompt_scale_shift_table", None),
+                video.timesteps,
+                video.prompt_timestep,
+                video.context_mask,
+                video.crossattn_cache_text,
             )
             if self._store_gate_stats:
                 with torch.no_grad():
@@ -404,11 +473,16 @@ class CausalAVTransformerBlock(nn.Module):
             ax = ax + ax_attn * agate_msa
 
             # Audio-text cross-attention (non-causal). Reuses crossattn cache.
-            ax_text_attn = self.audio_attn2(
+            ax_text_attn = self._apply_text_cross_attention(
                 rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
-                mask=audio.context_mask,
-                crossattn_cache=audio.crossattn_cache_text,
+                audio.context,
+                self.audio_attn2,
+                self.audio_scale_shift_table,
+                getattr(self, "audio_prompt_scale_shift_table", None),
+                audio.timesteps,
+                audio.prompt_timestep,
+                audio.context_mask,
+                audio.crossattn_cache_text,
             )
             if self._store_gate_stats:
                 with torch.no_grad():
@@ -511,7 +585,7 @@ class CausalAVTransformerBlock(nn.Module):
         # === Feed-Forward Networks ===
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None)
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
             vx = vx + self.ff(vx_scaled) * vgate_mlp
@@ -525,7 +599,7 @@ class CausalAVTransformerBlock(nn.Module):
 
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None)
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp

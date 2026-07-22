@@ -18,6 +18,7 @@ Data Format:
 
 from typing import Dict, Any, Optional
 from pathlib import Path
+import json
 
 import numpy as np
 import torch
@@ -73,6 +74,9 @@ class ODERegressionLMDBDataset(Dataset):
 
         # Get shapes
         self.video_shape = get_array_shape_from_lmdb(self.env, 'video_latents')
+        with self.env.begin() as txn:
+            manifest_bytes = txn.get(b"manifest_json")
+        self.manifest = json.loads(manifest_bytes.decode("utf-8")) if manifest_bytes else None
 
         # Check for sigmas
         self.has_sigmas = False

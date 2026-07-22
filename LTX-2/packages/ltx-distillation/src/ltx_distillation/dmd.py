@@ -279,6 +279,13 @@ class LTX2DMD(nn.Module):
         Models must exist before they can be wrapped with FSDP.
         """
         args = self.args
+        teacher_fp8_mode = str(getattr(args, "teacher_fp8_mode", "static"))
+        trainable_fp8_mode = str(getattr(args, "trainable_fp8_mode", "training"))
+        if teacher_fp8_mode != "static" or trainable_fp8_mode != "training":
+            raise ValueError(
+                "LTX-2.3 FP8 training requires teacher_fp8_mode=static and "
+                "trainable_fp8_mode=training"
+            )
 
         def _init_log(message: str) -> None:
             if not dist.is_initialized() or dist.get_rank() == 0:
@@ -295,6 +302,26 @@ class LTX2DMD(nn.Module):
         else:
             target_device = str(self.device)
         target_torch_device = torch.device(target_device)
+        wrap_during_init = bool(getattr(args, "fsdp_wrap_during_model_init", False))
+        stage1_ckpt = getattr(args, "stage1_ckpt_path", None)
+        stage1_strict = getattr(args, "stage1_ckpt_strict", True)
+        generator_ckpt = getattr(args, "generator_ckpt", None)
+        generator_ckpt_strict = getattr(args, "generator_ckpt_strict", True)
+        eager_generator_checkpoint = generator_ckpt or stage1_ckpt
+        eager_generator_strict = (
+            generator_ckpt_strict if generator_ckpt else stage1_strict
+        )
+        if (
+            self.generator_use_causal_wrapper
+            and str(getattr(args, "training_mode", "")).lower()
+            == "causal_self_forcing"
+            and not eager_generator_checkpoint
+            and not getattr(args, "resume_checkpoint", None)
+        ):
+            raise RuntimeError(
+                "Stage 3 requires a corrected Stage-2 checkpoint via "
+                "stage1_ckpt_path or generator_ckpt"
+            )
 
 
         def _load_checkpoint_state_dict(checkpoint_path: str) -> dict:
@@ -317,79 +344,10 @@ class LTX2DMD(nn.Module):
             return loaded
 
         
-        def _adapt_ltx23_adaln_state_dict(state_dict: dict) -> dict:
-            """Adapt LTX-2.3 9-way AdaLN tensors to the 6-way causal wrapper."""
-            adapted = {}
-            converted = 0
-        
-            for key, value in state_dict.items():
-                should_convert_table = key.endswith("scale_shift_table")
-                should_convert_linear = key in (
-                    "model.adaln_single.linear.weight",
-                    "model.adaln_single.linear.bias",
-                    "model.audio_adaln_single.linear.weight",
-                    "model.audio_adaln_single.linear.bias",
-                )
-        
-                if should_convert_table and value.ndim == 2 and value.shape[0] == 9:
-                    value = torch.cat([value[:3], value[6:]], dim=0)
-                    converted += 1
-                elif should_convert_linear and value.shape[0] % 9 == 0:
-                    dim = value.shape[0] // 9
-                    value = torch.cat([value[: 3 * dim], value[6 * dim :]], dim=0)
-                    converted += 1
-        
-                adapted[key] = value
-        
-            if converted:
-                print(f"  Adapted {converted} LTX-2.3 AdaLN tensors from 9-way to 6-way")
-            return adapted
-        def _remap_state_dict_keys(state_dict: dict) -> dict:
-            if not state_dict:
-                return state_dict
+        def _remap_state_dict_keys(state_dict: dict, *, preserve_fp8: bool = False) -> dict:
+            from ltx_distillation.ode.ode_regression import LTX2ODERegression
 
-            non_transformer_prefixes = (
-                "vae.", "audio_vae.", "vocoder.",
-                "model.vae.", "model.audio_vae.", "model.vocoder.",
-            )
-            remapped_non_transformer_prefixes = (
-                "model.audio_embeddings_connector.",
-                "model.video_embeddings_connector.",
-            )
-
-            sample_keys = list(state_dict.keys())[:20]
-            has_diffusion_model = any(k.startswith("model.diffusion_model.") for k in sample_keys)
-            if not has_diffusion_model:
-                has_diffusion_model = any(k.startswith("model.diffusion_model.") for k in state_dict)
-
-            if has_diffusion_model:
-                remapped = {}
-                for k, v in state_dict.items():
-                    if not k.startswith("model.diffusion_model."):
-                        continue
-                    new_key = "model." + k[len("model.diffusion_model."):]
-                    if any(new_key.startswith(p) for p in remapped_non_transformer_prefixes):
-                        continue
-                    remapped[new_key] = v
-                return remapped
-
-            first_key = next(iter(state_dict))
-            if first_key.startswith("model.velocity_model."):
-                return {
-                    "model." + k[len("model.velocity_model."):]: v
-                    for k, v in state_dict.items()
-                    if k.startswith("model.velocity_model.")
-                }
-            if first_key.startswith("model."):
-                return {
-                    k: v for k, v in state_dict.items()
-                    if not any(k.startswith(p) for p in non_transformer_prefixes)
-                }
-            return {
-                "model." + k: v
-                for k, v in state_dict.items()
-                if not any(k.startswith(p) for p in non_transformer_prefixes)
-            }
+            return LTX2ODERegression._remap_state_dict_keys(state_dict, preserve_fp8=preserve_fp8)
 
         def _is_bidirectional_wrapper_state_dict(state_dict: dict) -> bool:
             if not state_dict:
@@ -409,47 +367,15 @@ class LTX2DMD(nn.Module):
                 video_height=video_height,
                 video_width=video_width,
                 registry=shared_registry,
+                fp8_mode=teacher_fp8_mode,
             )
             if delegate_checkpoint_path:
                 _init_log(f"load bidirectional delegate state start path={delegate_checkpoint_path}")
                 delegate_state_dict = _load_checkpoint_state_dict(delegate_checkpoint_path)
-                load_result = delegate.load_state_dict(delegate_state_dict, strict=False)
-                if load_result is None:
-                    missing, unexpected = [], []
-                else:
-                    missing, unexpected = load_result
-                real_missing = [k for k in missing if "model.velocity_model" in k]
-                if real_missing or unexpected:
-                    print(
-                        f"[Stage3] Bidirectional delegate load from {delegate_checkpoint_path}: "
-                        f"missing={len(real_missing)} unexpected={len(unexpected)}"
-                    )
+                delegate.load_state_dict(delegate_state_dict, strict=True)
             _init_log("build bidirectional delegate wrapper done")
             delegate.eval()
             return delegate
-
-        def _adapt_caption_projection_state_dict(state_dict: dict, target_module) -> dict:
-            """Resize Stage-2/LTX caption projection weights for Stage-3 text conditioning widths."""
-            target_state = target_module.state_dict()
-            adapted = dict(state_dict)
-            converted = 0
-
-            for key, value in list(adapted.items()):
-                target = target_state.get(key)
-                if target is None or not torch.is_tensor(value) or not torch.is_tensor(target):
-                    continue
-                if value.shape == target.shape:
-                    continue
-                if value.ndim == 2 and target.ndim == 2 and value.shape[0] == target.shape[0]:
-                    resized = value.new_zeros(target.shape)
-                    shared_in = min(value.shape[1], target.shape[1])
-                    resized[:, :shared_in] = value[:, :shared_in]
-                    adapted[key] = resized
-                    converted += 1
-
-            if converted:
-                print(f"  Adapted {converted} caption projection tensors to Stage-3 text conditioning widths")
-            return adapted
 
         def _resolve_bidirectional_delegate_checkpoint() -> Optional[str]:
             explicit_delegate_ckpt = getattr(args, "bootstrap_bidirectional_ckpt_path", None)
@@ -468,34 +394,31 @@ class LTX2DMD(nn.Module):
 
             return None
 
-        def _build_wrapper(use_causal: bool):
+        def _build_wrapper(
+            use_causal: bool,
+            fp8_mode: str,
+            init_checkpoint: Optional[str] = None,
+            init_strict: bool = True,
+        ):
             if use_causal:
                 _init_log("build causal wrapper start")
                 checkpoint_config = _load_checkpoint_config(args.checkpoint_path)
-                use_caption_projection = not (
-                    checkpoint_config.get("caption_proj_before_connector", False)
-                    and not checkpoint_config.get("caption_projection_first_linear", True)
-                    and not checkpoint_config.get("caption_projection_second_linear", True)
-                )
-                causal_config = CausalLTXModelConfig(
+                causal_config = CausalLTXModelConfig.from_checkpoint_config(
+                    checkpoint_config,
                     num_frame_per_block=self.num_frame_per_block,
                     num_frame_per_block_first=getattr(args, "num_frame_per_block_first", 4),
                     enable_causal_log_rescale=getattr(args, "enable_causal_log_rescale", False),
-                    caption_channels=getattr(
-                        args,
-                        "caption_channels",
-                        checkpoint_config.get("caption_channels", 3840),
-                    ),
-                    audio_caption_channels=getattr(
-                        args,
-                        "audio_caption_channels",
-                        checkpoint_config.get("audio_caption_channels", None),
-                    ),
-                    cross_attention_dim=checkpoint_config.get("cross_attention_dim", 4096),
-                    audio_cross_attention_dim=checkpoint_config.get("audio_cross_attention_dim", 2048),
-                    use_caption_projection=use_caption_projection,
                 )
-                model = CausalLTXModel(causal_config).to(device=target_device, dtype=self.dtype)
+                from ltx_core.model.transformer import (
+                    checkpoint_fp8_module_names,
+                    convert_to_fp8_training,
+                    convert_to_static_fp8,
+                )
+                quantized_names = checkpoint_fp8_module_names(args.checkpoint_path)
+                model = CausalLTXModel(causal_config).to(dtype=self.dtype)
+                if fp8_mode == "static":
+                    convert_to_static_fp8(model, quantized_names)
+                model = model.to(device=target_device)
                 wrapper = CausalLTX2DiffusionWrapper(
                     model=model,
                     video_height=video_height,
@@ -504,30 +427,30 @@ class LTX2DMD(nn.Module):
                     num_frame_per_block_first=getattr(args, "num_frame_per_block_first", 4),
                     disable_causal_mask=getattr(args, "disable_causal_mask", False),
                 )
-                state_dict = _adapt_ltx23_adaln_state_dict(_remap_state_dict_keys(
-                    _load_checkpoint_state_dict(args.checkpoint_path)
-                ))
-                # Strip legacy sink-token entries from old checkpoints.
-                for legacy in [k for k in list(state_dict.keys()) if "audio_sink_tokens" in k]:
-                    state_dict.pop(legacy)
-                state_dict = _adapt_caption_projection_state_dict(state_dict, wrapper)
+                state_dict = _remap_state_dict_keys(
+                    _load_checkpoint_state_dict(args.checkpoint_path),
+                    preserve_fp8=fp8_mode == "static",
+                )
                 _init_log("load causal wrapper base state done")
-                missing, unexpected = wrapper.load_state_dict(state_dict, strict=False)
-                real_missing = [
-                    k for k in missing
-                    if "mask_builder" not in k and "causal_gate" not in k
-                ]
-                if real_missing:
-                    print(
-                        f"[Stage3] Causal init from {args.checkpoint_path}: "
-                        f"missing={len(real_missing)} unexpected={len(unexpected)}"
-                    )
+                wrapper.load_state_dict(state_dict, strict=True)
                 delegate = _build_bidirectional_delegate(_resolve_bidirectional_delegate_checkpoint())
                 wrapper.set_bidirectional_delegate(delegate)
+                if init_checkpoint:
+                    init_state = _remap_state_dict_keys(
+                        _load_checkpoint_state_dict(init_checkpoint),
+                        preserve_fp8=fp8_mode == "static",
+                    )
+                    wrapper.load_state_dict(init_state, strict=True)
+                if fp8_mode == "training":
+                    convert_to_fp8_training(model, quantized_names)
+                wrapper.fp8_mode = fp8_mode
+                if fp8_mode == "static":
+                    wrapper.requires_grad_(False)
+                    wrapper.eval()
                 _init_log("build causal wrapper done")
                 return wrapper
             _init_log("build bidirectional wrapper start")
-            return create_ltx2_wrapper(
+            wrapper = create_ltx2_wrapper(
                 checkpoint_path=args.checkpoint_path,
                 gemma_path=args.gemma_path,
                 device=target_torch_device,
@@ -535,18 +458,66 @@ class LTX2DMD(nn.Module):
                 video_height=video_height,
                 video_width=video_width,
                 registry=shared_registry,
+                fp8_mode=fp8_mode,
             )
+            if init_checkpoint:
+                wrapper.load_state_dict(
+                    _load_checkpoint_state_dict(init_checkpoint),
+                    strict=init_strict,
+                )
+            return wrapper
 
         checkpoint_state_cache: Dict[str, dict] = {}
         shared_registry = StateDictRegistry()
+        def _prepare_and_wrap_model(module, grad_config, wrap_strategy, checkpoint_grad=False):
+            module.set_module_grad(grad_config)
+            if checkpoint_grad and args.gradient_checkpointing:
+                module.enable_gradient_checkpointing()
+            if getattr(module, "fp8_mode", None) == "static":
+                _init_log("skip FSDP for frozen static FP8 Teacher")
+                return module
+            if not wrap_during_init:
+                return module
+
+            from ltx_distillation.util import fsdp_wrap
+
+            return fsdp_wrap(
+                module,
+                sharding_strategy=args.sharding_strategy,
+                mixed_precision=args.mixed_precision,
+                wrap_strategy=wrap_strategy,
+            )
+
         _init_log("generator wrapper init start")
-        self.generator = _build_wrapper(self.generator_use_causal_wrapper)
+        self.generator = _build_wrapper(
+            self.generator_use_causal_wrapper,
+            trainable_fp8_mode,
+            init_checkpoint=eager_generator_checkpoint if wrap_during_init else None,
+            init_strict=eager_generator_strict,
+        )
+        self.generator = _prepare_and_wrap_model(
+            self.generator,
+            args.generator_grad,
+            args.generator_fsdp_wrap_strategy,
+            checkpoint_grad=True,
+        )
         _init_log("generator wrapper init done")
         _init_log("real_score wrapper init start")
-        self.real_score = _build_wrapper(self.real_score_use_causal_wrapper)
+        self.real_score = _build_wrapper(self.real_score_use_causal_wrapper, teacher_fp8_mode)
+        self.real_score = _prepare_and_wrap_model(
+            self.real_score,
+            args.real_score_grad,
+            args.real_score_fsdp_wrap_strategy,
+        )
         _init_log("real_score wrapper init done")
         _init_log("fake_score wrapper init start")
-        self.fake_score = _build_wrapper(self.fake_score_use_causal_wrapper)
+        self.fake_score = _build_wrapper(self.fake_score_use_causal_wrapper, trainable_fp8_mode)
+        self.fake_score = _prepare_and_wrap_model(
+            self.fake_score,
+            args.fake_score_grad,
+            args.fake_score_fsdp_wrap_strategy,
+            checkpoint_grad=True,
+        )
         _init_log("fake_score wrapper init done")
 
         _init_log("text encoder init start")
@@ -562,6 +533,16 @@ class LTX2DMD(nn.Module):
             dtype=self.dtype,
             registry=shared_registry,
         )
+        self.text_encoder.requires_grad_(False)
+        if wrap_during_init and getattr(args, "text_encoder_device", "cuda") != "cpu":
+            from ltx_distillation.util import fsdp_wrap
+
+            self.text_encoder = fsdp_wrap(
+                self.text_encoder,
+                sharding_strategy=args.sharding_strategy,
+                mixed_precision=args.mixed_precision,
+                wrap_strategy=args.text_encoder_fsdp_wrap_strategy,
+            )
         _init_log("text encoder init done")
 
         _init_log("vae init start")
@@ -578,27 +559,28 @@ class LTX2DMD(nn.Module):
         )
         _init_log("vae init done")
 
-        # Set gradients
-        self.generator.set_module_grad(args.generator_grad)
-        self.real_score.set_module_grad(args.real_score_grad)
-        self.fake_score.set_module_grad(args.fake_score_grad)
-        self.text_encoder.requires_grad_(False)
+        # Stage 1 prepares and shards each 22B model before constructing the
+        # next one, avoiding three simultaneous full BF16 copies per GPU.
+        if not wrap_during_init:
+            self.generator.set_module_grad(args.generator_grad)
+            self.real_score.set_module_grad(args.real_score_grad)
+            self.fake_score.set_module_grad(args.fake_score_grad)
+            self.text_encoder.requires_grad_(False)
         if self.video_vae is not None:
             self.video_vae.requires_grad_(False)
         if self.audio_vae is not None:
             self.audio_vae.requires_grad_(False)
 
         # Enable gradient checkpointing if requested
-        if args.gradient_checkpointing:
+        if args.gradient_checkpointing and not wrap_during_init:
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
 
         # Checkpoint loading with priority:
         #   resume_checkpoint > generator_ckpt > stage1_ckpt_path
-        stage1_ckpt = getattr(args, "stage1_ckpt_path", None)
-        stage1_strict = getattr(args, "stage1_ckpt_strict", False)
-        generator_ckpt = getattr(args, "generator_ckpt", None)
-        generator_ckpt_strict = getattr(args, "generator_ckpt_strict", False)
+        if wrap_during_init:
+            generator_ckpt = None
+            stage1_ckpt = None
 
         if generator_ckpt:
             print(f"Loading pretrained generator from {generator_ckpt}")
@@ -606,13 +588,15 @@ class LTX2DMD(nn.Module):
             gen_sd = ckpt.get("generator", ckpt)
             if self.generator_use_causal_wrapper:
                 gen_sd = _remap_state_dict_keys(gen_sd)
-                gen_sd = _adapt_caption_projection_state_dict(gen_sd, self.generator)
-            missing_g, unexpected_g = self.generator.load_state_dict(gen_sd, strict=generator_ckpt_strict)
+            strict_generator_load = True if self.generator_use_causal_wrapper else generator_ckpt_strict
+            missing_g, unexpected_g = self.generator.load_state_dict(gen_sd, strict=strict_generator_load)
             real_missing_g = [k for k in missing_g if "mask_builder" not in k]
             if real_missing_g:
                 print(f"  [generator] missing keys ({len(real_missing_g)}): {real_missing_g[:10]}...")
             if unexpected_g:
                 print(f"  [generator] unexpected keys ({len(unexpected_g)}): {unexpected_g[:10]}...")
+            if self.generator_use_causal_wrapper and (real_missing_g or unexpected_g):
+                raise RuntimeError("Refusing to partially load a causal LTX-2.3 generator checkpoint")
 
             print("[Stage3] Generator checkpoint load complete")
 
@@ -627,18 +611,20 @@ class LTX2DMD(nn.Module):
             # The causal generator expects model.* keys, so remap before load.
             if self.generator_use_causal_wrapper:
                 gen_sd = _remap_state_dict_keys(gen_sd)
-                gen_sd = _adapt_caption_projection_state_dict(gen_sd, self.generator)
-            missing_g, unexpected_g = self.generator.load_state_dict(gen_sd, strict=stage1_strict)
+            strict_stage1_load = True if self.generator_use_causal_wrapper else stage1_strict
+            missing_g, unexpected_g = self.generator.load_state_dict(gen_sd, strict=strict_stage1_load)
             real_missing_g = [k for k in missing_g if "mask_builder" not in k]
             if real_missing_g:
                 print(f"  [generator] missing keys ({len(real_missing_g)}): {real_missing_g[:10]}...")
             if unexpected_g:
                 print(f"  [generator] unexpected keys ({len(unexpected_g)}): {unexpected_g[:10]}...")
+            if self.generator_use_causal_wrapper and (real_missing_g or unexpected_g):
+                raise RuntimeError("Refusing to partially load a causal LTX-2.3 Stage-2 checkpoint")
 
             # CausVid-style hybrid setup: only load Stage1 ckpt into fake_score
             # when fake_score itself is causal.
             if self.fake_score_use_causal_wrapper:
-                missing_f, unexpected_f = self.fake_score.load_state_dict(gen_sd, strict=stage1_strict)
+                missing_f, unexpected_f = self.fake_score.load_state_dict(gen_sd, strict=True)
                 real_missing_f = [k for k in missing_f if "mask_builder" not in k]
                 if real_missing_f:
                     print(f"  [fake_score] missing keys ({len(real_missing_f)}): {real_missing_f[:10]}...")

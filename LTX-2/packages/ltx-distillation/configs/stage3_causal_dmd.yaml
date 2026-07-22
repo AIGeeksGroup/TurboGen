@@ -11,21 +11,25 @@
 #   - ODE LMDB dataset
 
 # =============================================================================
-# Model Paths (UPDATE THESE TO YOUR LOCAL PATHS)
+# LTX-2.3 FP8 Model Paths
 # =============================================================================
 checkpoint_path: ../../../checkpoints/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors
 gemma_path: ../../../checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
+training_stage: stage3_causal_dmd
 
 # =============================================================================
 # Checkpoint Loading (Priority: resume_checkpoint > stage1_ckpt_path > generator_ckpt)
 # =============================================================================
 resume_checkpoint: null
 # Stage 2 ODE-initialized causal model (used as generator init)
-stage1_ckpt_path: ./saved_checkpoints/stage2_ode_4step_512_step5000.pt
+stage1_ckpt_path: null
 # No Stage 1 bidirectional DMD — real/fake scores init from original LTX-2 checkpoint
 generator_ckpt: null
 bootstrap_bidirectional_ckpt_path: null
-stage1_ckpt_strict: false
+stage1_ckpt_strict: true
+require_ltx23_architecture: true
+teacher_fp8_mode: static
+trainable_fp8_mode: training
 
 # =============================================================================
 # Model Configuration
@@ -128,6 +132,8 @@ block_weight_min: 0.5
 # =============================================================================
 mixed_precision: true
 gradient_checkpointing: true
+expected_world_size: 8
+fsdp_wrap_during_model_init: true
 batch_size: 1
 
 lr: 2.0e-05
@@ -160,7 +166,8 @@ ema_start_step: 200
 # Data Configuration
 # =============================================================================
 # Path to ODE LMDB dataset (same as Stage 2)
-data_path: ./ode_lmdb
+data_path: ./ode_lmdb_ltx23_v4
+require_ode_manifest: true
 benchmark_prompt_file: ./prompts/benchmark_8.txt
 
 negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, excessive noise, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, artifacts around text, inconsistent perspective, cartoonish rendering, uncanny valley effect, mismatched lip sync, silent or muted audio, distorted voice, off-sync audio, repetitive speech, jittery movement, unnatural transitions, flat lighting, stylized filters, or AI artifacts."
@@ -187,12 +194,25 @@ text_encoder_fsdp_wrap_strategy: size
 # Logging and Checkpointing
 # =============================================================================
 output_path: ./outputs/stage3_self_forcing_dmd
-log_iters: 100
+log_iters: 10
+save_iters: 500
 
 wandb_project: OmniForcing
-wandb_entity: 547634227-peking-university
+wandb_entity: OmniForcing1
 wandb_name: stage3_self_forcing_dmd
-wandb_api_key: "your-wandb-api-key"
+wandb_api_key: ""
+wandb_api_key_file: ../../../.wandb_key
+wandb_video_required: true
+
+# Upload every completed checkpoint directory (model weights and resume state).
+hf_upload_repo_id: aaachier/OmniForcing-backup
+hf_upload_token_file: ../../../.hf_token
+hf_upload_repo_type: model
+hf_upload_path_prefix: step3_ltx23
+hf_upload_create_repo: true
+hf_upload_blocking: true
+hf_upload_required: true
+hf_upload_benchmark: false
 
 seed: 42
 no_save: false
@@ -201,11 +221,11 @@ no_save: false
 # Benchmark Configuration
 # =============================================================================
 benchmark_enabled: true
-benchmark_iters: 100
+benchmark_iters: 500
 benchmark_num_prompts: 8
 benchmark_seed: 12345
 benchmark_video_fps: 24
-benchmark_audio_sample_rate: 24000
+benchmark_audio_sample_rate: 48000
 
 benchmark_mode: causal
 benchmark_num_frame_per_block: 3

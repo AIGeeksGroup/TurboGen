@@ -16,15 +16,17 @@ Reference: CausVid (https://arxiv.org/abs/2412.07772) Section 4.3
 """
 
 import os
+import json
 import time
 import logging
 import argparse
 import functools
 import gc
-import subprocess
-import sys
+import socket
+from dataclasses import asdict
 from collections import defaultdict
-from typing import Dict, Any, Optional, Iterator
+from datetime import timedelta
+from typing import Dict, Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -41,10 +43,20 @@ from torch.distributed.fsdp.wrap import (
 from omegaconf import OmegaConf, DictConfig
 import wandb
 
-from ltx_distillation.inference.causal_pipeline import CausalAVInferencePipeline
+from ltx_distillation.inference.ode_benchmark_pipeline import ODEAutoregressiveBenchmarkPipeline
 from ltx_distillation.ode.data import ODERegressionLMDBDataset, collate_ode_batch
 from ltx_distillation.ode.ode_regression import LTX2ODERegression, ODERegressionConfig
-from ltx_distillation.util import fsdp_state_dict as shared_fsdp_state_dict
+from ltx_distillation.util import (
+    fsdp_state_dict as shared_fsdp_state_dict,
+    ResumableDataIterator,
+    ResumableDistributedSampler,
+    capture_rng_state,
+    restore_rng_state,
+    upload_checkpoint_to_hf,
+    validate_artifact_upload_config,
+    resolve_wandb_api_key,
+    wandb_video_from_path,
+)
 
 
 # ============================================================================
@@ -53,9 +65,13 @@ from ltx_distillation.util import fsdp_state_dict as shared_fsdp_state_dict
 
 def launch_distributed_job():
     """Initialize distributed training environment."""
+    timeout_minutes = int(os.environ.get("DIST_TIMEOUT_MINUTES", "120"))
     if 'RANK' in os.environ:
         # Launched via torchrun
-        dist.init_process_group(backend='nccl')
+        dist.init_process_group(
+            backend='nccl',
+            timeout=timedelta(minutes=timeout_minutes),
+        )
         torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     elif torch.cuda.is_available():
         # Single GPU fallback
@@ -64,6 +80,7 @@ def launch_distributed_job():
             init_method='tcp://localhost:29500',
             world_size=1,
             rank=0,
+            timeout=timedelta(minutes=timeout_minutes),
         )
         torch.cuda.set_device(0)
     else:
@@ -82,17 +99,6 @@ def barrier():
         dist.barrier()
 
 
-def cycle(dataloader) -> Iterator:
-    """Infinite iterator over dataloader with proper shuffle each epoch."""
-    epoch = 0
-    while True:
-        if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
-            dataloader.sampler.set_epoch(epoch)
-        for batch in dataloader:
-            yield batch
-        epoch += 1
-
-
 def init_logging_folder(config: DictConfig):
     """Initialize output and wandb folders."""
     output_path = config.output_path
@@ -102,14 +108,15 @@ def init_logging_folder(config: DictConfig):
     os.makedirs(wandb_folder, exist_ok=True)
 
     # Set wandb API key from config if provided (needed for multi-node)
-    wandb_api_key = config.get("wandb_api_key", "")
+    wandb_api_key = resolve_wandb_api_key(config)
     if wandb_api_key:
         os.environ["WANDB_API_KEY"] = wandb_api_key
 
     # Initialize wandb
+    wandb_entity = config.get("wandb_entity", None) or None
     wandb.init(
-        project=config.get("wandb_project", "Omniforcing-Stage2-OdeInit"),
-        entity=config.get("wandb_entity", None),
+        project=config.get("wandb_project", "OmniForcing"),
+        entity=wandb_entity,
         name=config.get("wandb_name", "ltx2_causal_ode"),
         dir=wandb_folder,
         config=OmegaConf.to_container(config),
@@ -208,6 +215,8 @@ class ODETrainer:
 
     def __init__(self, config: DictConfig):
         self.config = config
+        self.training_stage = str(config.get("training_stage", "stage2_causal_ode"))
+        validate_artifact_upload_config(config)
 
         # Initialize distributed
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -216,11 +225,24 @@ class ODETrainer:
         launch_distributed_job()
         global_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+        expected_world_size = int(config.get("expected_world_size", 0) or 0)
+        if expected_world_size and self.world_size != expected_world_size:
+            raise RuntimeError(
+                "Distributed world-size mismatch: "
+                f"expected {expected_world_size}, got {self.world_size}. "
+                "The corrected Step-2 job must run with all requested GPUs."
+            )
 
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
         self.global_rank = global_rank
         self.is_main_process = global_rank == 0
+        print(
+            "[dist] "
+            f"host={socket.gethostname()} rank={self.global_rank}/{self.world_size} "
+            f"local_rank={os.environ.get('LOCAL_RANK', '0')} device={self.device}",
+            flush=True,
+        )
 
         # Diagnostic state (rank 0 only writes to log file)
         self._block_diag = []
@@ -244,10 +266,25 @@ class ODETrainer:
             os.makedirs(self.output_path, exist_ok=True)
         barrier()
 
-        # Initialize model
+        # Initialize model. Exact resume uses the same model file for the
+        # pre-FSDP weight load, then restores rank-local optimizer state later.
+        resume_checkpoint = config.get("resume_checkpoint")
+        causal_model_checkpoint = config.get("causal_model_checkpoint")
+        if resume_checkpoint:
+            if (
+                causal_model_checkpoint
+                and os.path.realpath(str(causal_model_checkpoint))
+                != os.path.realpath(str(resume_checkpoint))
+            ):
+                raise RuntimeError(
+                    "resume_checkpoint and causal_model_checkpoint must refer to "
+                    "the same model.pt when exact resume is requested."
+                )
+            causal_model_checkpoint = resume_checkpoint
+
         ode_config = ODERegressionConfig(
             checkpoint_path=config.get("checkpoint_path", ""),
-            causal_model_checkpoint=config.get("causal_model_checkpoint"),
+            causal_model_checkpoint=causal_model_checkpoint,
             bidirectional_model_checkpoint=config.get("bidirectional_model_checkpoint"),
             text_encoder_checkpoint=config.text_encoder_checkpoint,
             denoising_step_list=tuple(config.denoising_step_list),
@@ -266,6 +303,8 @@ class ODETrainer:
             # Loss weights
             video_loss_weight=config.get("video_loss_weight", 1.0),
             audio_loss_weight=config.get("audio_loss_weight", 0.0),
+            require_ltx23_architecture=config.get("require_ltx23_architecture", True),
+            trainable_fp8_mode=config.get("trainable_fp8_mode", "training"),
         )
 
         self.ode_model = LTX2ODERegression(ode_config, device=self.device)
@@ -321,9 +360,65 @@ class ODETrainer:
             max_pair=config.get("max_pair", int(1e8)),
             load_audio=config.get("load_audio", True),
         )
+        if config.get("require_ode_manifest", True):
+            if dataset.manifest is None:
+                raise RuntimeError(
+                    f"ODE dataset has no LTX-2.3 provenance manifest: {config.data_path}. "
+                    "Generate a fresh dataset instead of reusing ode_lmdb."
+                )
+            if dataset.manifest.get("format_version") != 4:
+                raise RuntimeError(
+                    f"Unsupported ODE dataset format in {config.data_path}: "
+                    f"{dataset.manifest.get('format_version')}"
+                )
+            if dataset.manifest.get("producer") != "omniforcing-ltx23-full-architecture-v2":
+                raise RuntimeError(
+                    f"Unsupported ODE dataset producer in {config.data_path}: "
+                    f"{dataset.manifest.get('producer')}"
+                )
+            teacher_checkpoint = os.path.realpath(
+                dataset.manifest.get("teacher_checkpoint", "")
+            )
+            expected_checkpoint = os.path.realpath(str(config.checkpoint_path))
+            if teacher_checkpoint != expected_checkpoint:
+                raise RuntimeError(
+                    "ODE dataset teacher checkpoint does not match training checkpoint: "
+                    f"{teacher_checkpoint} != {expected_checkpoint}"
+                )
+            generation_config = dataset.manifest.get("generation_config")
+            if not isinstance(generation_config, dict):
+                raise RuntimeError(
+                    f"ODE dataset has no generation_config: {config.data_path}"
+                )
+            generated_steps = generation_config.get(
+                "denoising_step_list"
+            )
+            if list(generated_steps or []) != list(config.denoising_step_list):
+                raise RuntimeError(
+                    "ODE dataset denoising schedule does not match training config: "
+                    f"{generated_steps} != {list(config.denoising_step_list)}"
+                )
+            expected_generation_values = {
+                "video_height": int(config.get("video_height", 512)),
+                "video_width": int(config.get("video_width", 768)),
+            }
+            mismatched_generation_values = {
+                key: (generation_config.get(key), expected)
+                for key, expected in expected_generation_values.items()
+                if generation_config.get(key) != expected
+            }
+            if mismatched_generation_values:
+                raise RuntimeError(
+                    "ODE dataset geometry does not match training config: "
+                    f"{mismatched_generation_values}"
+                )
+            if not dataset.has_sigmas:
+                raise RuntimeError(
+                    f"ODE dataset has no exact scheduler sigmas: {config.data_path}"
+                )
         self.dataset = dataset
 
-        sampler = torch.utils.data.distributed.DistributedSampler(
+        sampler = ResumableDistributedSampler(
             dataset, shuffle=True, drop_last=True
         )
 
@@ -334,8 +429,10 @@ class ODETrainer:
             num_workers=config.get("num_workers", 8),
             collate_fn=collate_ode_batch,
             pin_memory=True,
+            generator=torch.Generator(),
         )
-        self.data_iter = cycle(self.dataloader)
+        data_seed = int(config.seed) + self.global_rank * 1_000_003
+        self.data_iter = ResumableDataIterator(self.dataloader, seed=data_seed)
 
         # Benchmark uses the first N prompts from the training LMDB so that
         # every evaluation round is directly comparable across checkpoints.
@@ -373,8 +470,21 @@ class ODETrainer:
         self.max_grad_norm = config.get("max_grad_norm", 10.0)
         self.gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
         self.previous_time = None
+        self._pending_visualization = None
+
+        if resume_checkpoint:
+            self._restore_training_state(resume_checkpoint)
 
         if self.is_main_process:
+            if resume_checkpoint:
+                print(
+                    f"[Resume] Restored generator, AdamW state, RNG state, and step={self.step}."
+                )
+            elif config.get("causal_model_checkpoint"):
+                print(
+                    "[Warm Start] Loaded generator weights only. AdamW state and "
+                    "the step counter start from zero; this is not an exact resume."
+                )
             effective_batch = config.batch_size * self.gradient_accumulation_steps * self.world_size
             print(f"Gradient accumulation: {self.gradient_accumulation_steps} steps, "
                   f"effective batch size = {config.batch_size} x {self.gradient_accumulation_steps} x {self.world_size} = {effective_batch}")
@@ -421,8 +531,15 @@ class ODETrainer:
             self.audio_decoder = ledger.audio_decoder().to(self.device).eval()
             self.vocoder = ledger.vocoder().to(self.device).eval()
             self.audio_sample_rate = int(self.vocoder.output_sample_rate)
-            if not self.benchmark_audio_sample_rate_explicit:
-                self.benchmark_audio_sample_rate = self.audio_sample_rate
+            if (
+                self.benchmark_audio_sample_rate_explicit is not None
+                and self.benchmark_audio_sample_rate != self.audio_sample_rate
+            ):
+                raise RuntimeError(
+                    "benchmark_audio_sample_rate does not match the checkpoint vocoder: "
+                    f"{self.benchmark_audio_sample_rate} != {self.audio_sample_rate}"
+                )
+            self.benchmark_audio_sample_rate = self.audio_sample_rate
             self.video_decoder.requires_grad_(False)
             self.audio_decoder.requires_grad_(False)
             self.vocoder.requires_grad_(False)
@@ -444,11 +561,14 @@ class ODETrainer:
         self.benchmark_seed = int(getattr(config, "benchmark_seed", 12345))
         self.benchmark_num_prompts = int(getattr(config, "benchmark_num_prompts", 2))
         self.benchmark_video_fps = int(getattr(config, "benchmark_video_fps", 24))
+        self.wandb_video_required = bool(
+            getattr(config, "wandb_video_required", False)
+        )
         self.benchmark_audio_sample_rate_explicit = getattr(config, "benchmark_audio_sample_rate", None)
         self.benchmark_audio_sample_rate = int(
             self.benchmark_audio_sample_rate_explicit
             if self.benchmark_audio_sample_rate_explicit is not None
-            else 24000
+            else 48000
         )
         self.benchmark_num_frame_per_block = int(
             getattr(config, "benchmark_num_frame_per_block", getattr(config, "num_frame_per_block", 3))
@@ -636,32 +756,21 @@ class ODETrainer:
                 f"across {self.world_size} rank(s) in {num_rounds} round(s)..."
             )
 
-        pipeline = CausalAVInferencePipeline(
-            generator=self.ode_model._generator,
-            add_noise_fn=self._benchmark_add_noise,
-            denoising_sigmas=self.benchmark_denoising_sigmas,
-            num_frame_per_block=self.benchmark_num_frame_per_block,
-            num_frame_per_block_first=getattr(self.config, "num_frame_per_block_first", 4),
-            context_noise=int(getattr(self.config, "context_noise", 0)),
-            num_train_timestep=int(getattr(self.config, "num_train_timestep", 1000)),
-            clear_cuda_cache_per_round=self.benchmark_clear_cuda_cache_per_round,
-        )
-
         was_training = self.ode_model._generator.training
         self.ode_model._generator.eval()
 
         # Pass the FSDP-wrapped generator directly. FSDP all-gathers parameters
         # inside forward(), so we don't need summon_full_params. The pipeline
-        # calls self.generator(...) which goes through __call__ 鈫?FSDP hooks.
-        pipeline = CausalAVInferencePipeline(
+        # calls self.generator(...) which goes through __call__ and FSDP hooks.
+        pipeline = ODEAutoregressiveBenchmarkPipeline(
             generator=self.ode_model._generator,
             add_noise_fn=self._benchmark_add_noise,
             denoising_sigmas=self.benchmark_denoising_sigmas,
             num_frame_per_block=self.benchmark_num_frame_per_block,
             num_frame_per_block_first=getattr(self.config, "num_frame_per_block_first", 4),
-            context_noise=int(getattr(self.config, "context_noise", 0)),
-            num_train_timestep=int(getattr(self.config, "num_train_timestep", 1000)),
             clear_cuda_cache_per_round=self.benchmark_clear_cuda_cache_per_round,
+            transition_mode="euler",
+            use_bidirectional_bootstrap=False,
         )
 
         benchmark_wall_start = time.perf_counter()
@@ -724,20 +833,23 @@ class ODETrainer:
 
             for idx in range(num_prompts):
                 latent_path = os.path.join(step_dir, f"sample_{idx}.pt")
-                if not os.path.exists(latent_path):
-                    continue
-
-                sample_path = self._decode_benchmark_latents(
-                    latent_path=latent_path,
-                    prompt_idx=idx,
-                    step_dir=step_dir,
-                )
-                if sample_path is not None and os.path.exists(sample_path):
-                    benchmark_wandb_dict[f"benchmark/sample_{idx}"] = wandb.Video(
-                        sample_path,
-                        fps=self.benchmark_video_fps,
-                        format="mp4",
+                sample_path = None
+                if os.path.exists(latent_path):
+                    sample_path = self._decode_benchmark_latents(
+                        latent_path=latent_path,
+                        prompt_idx=idx,
+                        step_dir=step_dir,
                     )
+                media_key = f"benchmark/sample_{idx}"
+                expected_path = os.path.join(step_dir, f"sample_{idx}.mp4")
+                video_media = wandb_video_from_path(
+                    sample_path or expected_path,
+                    fps=self.benchmark_video_fps,
+                    key=media_key,
+                    required=self.wandb_video_required,
+                )
+                if video_media is not None:
+                    benchmark_wandb_dict[media_key] = video_media
                 prompt_rows.append([idx, self.benchmark_prompts[idx], sample_path or latent_path])
 
             if prompt_rows:
@@ -747,122 +859,267 @@ class ODETrainer:
                 )
 
             wandb.log(benchmark_wandb_dict, step=self.step)
+            video_count = sum(
+                key.startswith("benchmark/sample_")
+                for key in benchmark_wandb_dict
+            )
+            print(
+                f"[WANDB_VIDEO] logged {video_count} benchmark video(s) "
+                f"at step {self.step}",
+                flush=True,
+            )
 
             print(
                 f"[Benchmark] Step {self.step}: {num_prompts} sample(s) | "
                 f"saved to {step_dir}",
                 flush=True,
             )
+            self._maybe_upload_benchmark_to_hf(step_dir)
 
         barrier()
 
+    def _resume_signature(self) -> dict:
+        config = self.config
+        return {
+            "training_stage": self.training_stage,
+            "base_checkpoint": os.path.realpath(str(config.checkpoint_path)),
+            "data_path": os.path.realpath(str(config.data_path)),
+            "generator_task": str(config.generator_task),
+            "denoising_step_list": list(config.denoising_step_list),
+            "batch_size": int(config.batch_size),
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "lr": float(config.lr),
+            "beta1": float(config.get("beta1", 0.9)),
+            "beta2": float(config.get("beta2", 0.999)),
+            "weight_decay": float(config.get("weight_decay", 0.0)),
+            "seed": int(config.seed),
+            "mixed_precision": bool(config.mixed_precision),
+            "sharding_strategy": str(config.sharding_strategy),
+            "generator_fsdp_wrap_strategy": str(
+                config.get("generator_fsdp_wrap_strategy", "transformer")
+            ),
+            "teacher_fp8_mode": str(config.get("teacher_fp8_mode", "")),
+            "trainable_fp8_mode": str(config.get("trainable_fp8_mode", "")),
+            "loss_target": str(config.get("loss_target", "velocity")),
+            "uniform_timestep": bool(config.get("uniform_timestep", False)),
+            "disable_causal_mask": bool(config.get("disable_causal_mask", False)),
+            "enable_causal_log_rescale": bool(
+                config.get("enable_causal_log_rescale", False)
+            ),
+            "skip_cross_modal_attention": bool(
+                config.get("skip_cross_modal_attention", False)
+            ),
+            "video_loss_weight": float(config.get("video_loss_weight", 1.0)),
+            "audio_loss_weight": float(config.get("audio_loss_weight", 1.0)),
+            "num_frames": int(config.num_frames),
+            "video_height": int(config.video_height),
+            "video_width": int(config.video_width),
+            "num_frame_per_block": int(config.get("num_frame_per_block", 3)),
+            "num_frame_per_block_first": int(
+                config.get("num_frame_per_block_first", 4)
+            ),
+        }
+
+    def _restore_training_state(self, checkpoint_path: str) -> None:
+        checkpoint_dir = os.path.dirname(os.path.realpath(checkpoint_path))
+        manifest_path = os.path.join(checkpoint_dir, "trainer_state.json")
+        if not os.path.isfile(manifest_path):
+            raise RuntimeError(
+                f"Exact resume metadata is missing: {manifest_path}. "
+                "Use causal_model_checkpoint for a weights-only warm start instead."
+            )
+
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if int(manifest.get("format_version", 0)) != 2:
+            raise RuntimeError(
+                f"Unsupported Step-2 trainer-state format: {manifest.get('format_version')}"
+            )
+        if manifest.get("training_stage") != self.training_stage:
+            raise RuntimeError(
+                "Training stage changed across resume: "
+                f"{manifest.get('training_stage')} != {self.training_stage}"
+            )
+        saved_world_size = int(manifest.get("world_size", 0))
+        if saved_world_size != self.world_size:
+            raise RuntimeError(
+                "Exact Step-2 resume requires the original FSDP topology: "
+                f"checkpoint world_size={saved_world_size}, current world_size={self.world_size}."
+            )
+        saved_signature = manifest.get("resume_signature")
+        current_signature = self._resume_signature()
+        if saved_signature != current_signature:
+            keys = sorted(set(saved_signature or {}) | set(current_signature))
+            mismatches = {
+                key: ((saved_signature or {}).get(key), current_signature.get(key))
+                for key in keys
+                if (saved_signature or {}).get(key) != current_signature.get(key)
+            }
+            raise RuntimeError(f"Training configuration changed across resume: {mismatches}")
+
+        checkpoint = torch.load(
+            os.path.realpath(checkpoint_path),
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        if int(checkpoint.get("format_version", 0)) != 4:
+            raise RuntimeError(
+                f"Unsupported Step-2 model checkpoint format: {checkpoint.get('format_version')}"
+            )
+        if checkpoint.get("training_stage") != self.training_stage:
+            raise RuntimeError("Step-2 model checkpoint has the wrong training_stage")
+        if int(checkpoint.get("step", -1)) != int(manifest.get("step", -2)):
+            raise RuntimeError("model.pt and trainer_state.json have different steps")
+        if not isinstance(checkpoint.get("generator"), dict):
+            raise RuntimeError("Step-2 model checkpoint has no generator state")
+        del checkpoint
+
+        rank_state_path = os.path.join(
+            checkpoint_dir, f"trainer_state_rank_{self.global_rank:05d}.pt"
+        )
+        if not os.path.isfile(rank_state_path):
+            raise RuntimeError(f"Exact resume shard is missing: {rank_state_path}")
+
+        rank_state = torch.load(
+            rank_state_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        if int(rank_state.get("format_version", 0)) != 2:
+            raise RuntimeError(
+                f"Unsupported rank trainer-state format: {rank_state.get('format_version')}"
+            )
+        if int(rank_state.get("rank", -1)) != self.global_rank:
+            raise RuntimeError(f"Resume shard rank mismatch in {rank_state_path}")
+        if int(rank_state.get("world_size", 0)) != self.world_size:
+            raise RuntimeError(f"Resume shard world-size mismatch in {rank_state_path}")
+
+        self.optimizer.load_state_dict(rank_state["optimizer"])
+        self.step = int(manifest["step"])
+        max_steps = self.config.get("max_steps", float("inf"))
+        if max_steps <= self.step:
+            raise RuntimeError(
+                f"Resume max_steps must be greater than saved step {self.step}, got {max_steps}."
+            )
+        if int(rank_state.get("step", -1)) != self.step:
+            raise RuntimeError(f"Resume shard step mismatch in {rank_state_path}")
+        self.data_iter.load_state_dict(rank_state["data_iterator"])
+        restore_rng_state(rank_state["rng_state"], device=self.device)
+        del rank_state
+        barrier()
+
     def save(self):
-        """Save checkpoint."""
+        """Save inference weights and same-topology distributed training state."""
         print("Gathering distributed model states...")
 
         generator_state_dict = fsdp_state_dict(self.ode_model._generator)
 
-        state_dict = {
-            "generator": generator_state_dict,
+        architecture = asdict(self.ode_model._make_model_config())
+        rope_type = architecture.get("rope_type")
+        if hasattr(rope_type, "value"):
+            architecture["rope_type"] = rope_type.value
+
+        checkpoint_dir = os.path.join(
+            self.output_path,
+            f"checkpoint_{self.step:06d}"
+        )
+        if self.is_main_process:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        barrier()
+
+        saved_rng_state = capture_rng_state(device=self.device)
+        rank_state = {
+            "format_version": 2,
+            "rank": self.global_rank,
+            "world_size": self.world_size,
             "step": self.step,
+            "optimizer": self.optimizer.state_dict(),
+            "data_iterator": self.data_iter.state_dict(),
+            "rng_state": saved_rng_state,
         }
+        rank_state_path = os.path.join(
+            checkpoint_dir, f"trainer_state_rank_{self.global_rank:05d}.pt"
+        )
+        rank_state_tmp = f"{rank_state_path}.tmp"
+        torch.save(rank_state, rank_state_tmp)
+        os.replace(rank_state_tmp, rank_state_path)
+        del rank_state
+        barrier()
 
         if self.is_main_process:
-            checkpoint_dir = os.path.join(
-                self.output_path,
-                f"checkpoint_{self.step:06d}"
-            )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
+            state_dict = {
+                "format_version": 4,
+                "checkpoint_kind": "generator_with_distributed_training_state",
+                "training_stage": self.training_stage,
+                "optimizer_state_saved": True,
+                "resume_world_size": self.world_size,
+                "resume_state_pattern": "trainer_state_rank_{rank:05d}.pt",
+                "generator": generator_state_dict,
+                "step": self.step,
+                "base_checkpoint": str(self.config.get("checkpoint_path", "")),
+                "architecture": architecture,
+                "training_config": OmegaConf.to_container(self.config, resolve=True),
+            }
             checkpoint_path = os.path.join(checkpoint_dir, "model.pt")
-            torch.save(state_dict, checkpoint_path)
+            checkpoint_tmp = f"{checkpoint_path}.tmp"
+            torch.save(state_dict, checkpoint_tmp)
+            os.replace(checkpoint_tmp, checkpoint_path)
+
+            manifest = {
+                "format_version": 2,
+                "training_stage": self.training_stage,
+                "step": self.step,
+                "world_size": self.world_size,
+                "optimizer": "AdamW",
+                "optimizer_state_saved": True,
+                "rng_state_saved": ["python", "numpy", "torch", "cuda"],
+                "rank_state_pattern": "trainer_state_rank_{rank:05d}.pt",
+                "data_iterator_resume": "exact_epoch_batch",
+                "resume_signature": self._resume_signature(),
+            }
+            manifest_path = os.path.join(checkpoint_dir, "trainer_state.json")
+            manifest_tmp = f"{manifest_path}.tmp"
+            with open(manifest_tmp, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(manifest_tmp, manifest_path)
             print(f"Model saved to {checkpoint_path}")
             self._maybe_upload_checkpoint_to_hf(checkpoint_dir)
 
-        del generator_state_dict, state_dict
+        barrier()
+        del generator_state_dict
+        restore_rng_state(saved_rng_state, device=self.device)
+        del saved_rng_state
         gc.collect()
         torch.cuda.empty_cache()
 
     def _maybe_upload_checkpoint_to_hf(self, checkpoint_dir: str) -> None:
         """Optionally upload a completed checkpoint directory to Hugging Face."""
-        repo_id = self.config.get("hf_upload_repo_id", "")
-        if not repo_id:
-            return
-
-        token = os.environ.get("HF_TOKEN", "")
-        token_file = self.config.get("hf_upload_token_file", "")
-        if not token and token_file and os.path.isfile(token_file):
-            with open(token_file, "r", encoding="utf-8") as handle:
-                token = handle.read().strip()
-        if not token:
-            print("[HF_UPLOAD] skipped: HF_TOKEN is empty", flush=True)
-            return
-
-        path_prefix = str(self.config.get("hf_upload_path_prefix", ""))
-        checkpoint_name = os.path.basename(os.path.normpath(checkpoint_dir))
-        if path_prefix:
-            path_in_repo = f"{path_prefix.rstrip('/')}/{checkpoint_name}"
-        else:
-            path_in_repo = checkpoint_name
-
-        repo_type = str(self.config.get("hf_upload_repo_type", "model"))
-        create_repo = bool(self.config.get("hf_upload_create_repo", True))
-        blocking = bool(self.config.get("hf_upload_blocking", False))
-        commit_message = f"Upload {checkpoint_name}"
-
-        code = r'''
-import os
-import sys
-from huggingface_hub import HfApi
-
-checkpoint_dir, repo_id, repo_type, path_in_repo, create_repo, commit_message = sys.argv[1:]
-token = os.environ["HF_TOKEN"]
-api = HfApi(token=token)
-if create_repo == "1":
-    api.create_repo(repo_id=repo_id, repo_type=repo_type, token=token, exist_ok=True)
-api.upload_folder(
-    folder_path=checkpoint_dir,
-    path_in_repo=path_in_repo,
-    repo_id=repo_id,
-    repo_type=repo_type,
-    token=token,
-    commit_message=commit_message,
-)
-print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flush=True)
-'''
-        cmd = [
-            sys.executable,
-            "-c",
-            code,
+        upload_checkpoint_to_hf(
             checkpoint_dir,
-            repo_id,
-            repo_type,
-            path_in_repo,
-            "1" if create_repo else "0",
-            commit_message,
-        ]
-        env = os.environ.copy()
-        env["HF_TOKEN"] = token
-        env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+            self.config,
+            output_path=self.output_path,
+        )
 
-        try:
-            if blocking:
-                print(f"[HF_UPLOAD] uploading {checkpoint_dir} to {repo_id}/{path_in_repo}", flush=True)
-                subprocess.run(cmd, check=False, env=env)
-            else:
-                log_path = os.path.join(self.output_path, "hf_upload.log")
-                print(f"[HF_UPLOAD] queued {checkpoint_dir} to {repo_id}/{path_in_repo}", flush=True)
-                with open(log_path, "ab", buffering=0) as log_file:
-                    subprocess.Popen(
-                        cmd,
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                        close_fds=True,
-                        env=env,
-                        start_new_session=True,
-                    )
-        except Exception as exc:
-            print(f"[HF_UPLOAD] failed to launch upload: {type(exc).__name__}: {exc}", flush=True)
+    def _maybe_upload_benchmark_to_hf(self, benchmark_dir: str) -> None:
+        """Upload the decoded fixed-prompt videos beside the matching checkpoint."""
+        if not bool(self.config.get("hf_upload_benchmark", False)):
+            return
+
+        original_prefix = str(self.config.get("hf_upload_path_prefix", ""))
+        benchmark_prefix = (
+            f"{original_prefix.rstrip('/')}/benchmark"
+            if original_prefix
+            else "benchmark"
+        )
+        upload_checkpoint_to_hf(
+            benchmark_dir,
+            self.config,
+            output_path=self.output_path,
+            path_prefix=benchmark_prefix,
+        )
 
     def _should_visualize(self) -> bool:
         """Check if we should visualize on this step."""
@@ -870,13 +1127,16 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
             return False
         if self.video_decoder is None:
             return False
-        return self.step > 0 and self.step % self.visualize_iters == 0
+        completed_step = self.step + 1
+        return completed_step % self.visualize_iters == 0
 
     @torch.no_grad()
     def _add_visualization(
         self,
         log_dict: dict,
         wandb_dict: dict,
+        *,
+        completed_step: Optional[int] = None,
     ) -> None:
         """Decode latents and save video/audio files to output folder.
 
@@ -885,14 +1145,17 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
 
         Args:
             log_dict: Output from generator_loss(return_samples=True).
-            wandb_dict: Dict to add wandb scalars into (no video/audio media)
+            wandb_dict: Dict to add WandB scalars and decoded video media into.
         """
         from ltx_core.model.video_vae import decode_video as vae_decode_video
         from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
         from ltx_pipelines.utils.media_io import encode_video
         import torchaudio
 
-        vis_dir = os.path.join(self.output_path, "visualizations", f"step_{self.step:06d}")
+        completed_step = self.step + 1 if completed_step is None else int(completed_step)
+        vis_dir = os.path.join(
+            self.output_path, "visualizations", f"step_{completed_step:06d}"
+        )
         os.makedirs(vis_dir, exist_ok=True)
 
         # --- Video decode ---
@@ -962,6 +1225,22 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
                 print(f"[Vis] Saved {mp4_path}")
             except Exception as e:
                 print(f"[Vis] ERROR saving {mp4_path}: {e}")
+
+            media_key = f"visualization/{vkey}"
+            video_media = wandb_video_from_path(
+                mp4_path,
+                fps=24,
+                key=media_key,
+                required=self.wandb_video_required and vkey == "pred_video",
+            )
+            if video_media is not None:
+                wandb_dict[media_key] = video_media
+
+        if self.wandb_video_required and "visualization/pred_video" not in wandb_dict:
+            raise RuntimeError(
+                "Required training visualization 'pred_video' was not generated "
+                f"at step {completed_step}."
+            )
 
         # Save audio as separate .wav files
         for akey, audio in decoded_audios.items():
@@ -1085,6 +1364,8 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
             # Gradient clipping + optimizer step
             grad_norm = self.ode_model._generator.clip_grad_norm_(self.max_grad_norm)
             self.optimizer.step()
+            from ltx_distillation.util import refresh_fp8_training_scales
+            refresh_fp8_training_scales(self.ode_model._generator)
         else:
             grad_norm = torch.tensor(0.0)
 
@@ -1109,11 +1390,47 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
                     f"(details in diagnostics.log)"
                 )
 
-            # Add video/audio visualization on visualization steps
+            # Preserve only detached visualization tensors. Decoding and WandB
+            # media upload happen after this step's checkpoint/HF upload.
             if visualize:
-                self._add_visualization(log_dict, log_data)
+                visualization_keys = (
+                    "pred_video",
+                    "target_video",
+                    "noisy_video",
+                    "pred_audio",
+                    "target_audio",
+                )
+                self._pending_visualization = {
+                    key: log_dict[key].detach()
+                    for key in visualization_keys
+                    if key in log_dict and torch.is_tensor(log_dict[key])
+                }
 
-            wandb.log(log_data, step=self.step)
+            completed_step = self.step + 1
+            wandb.log(log_data, step=completed_step)
+
+    def _flush_pending_visualization(self) -> None:
+        if not self.is_main_process or self._pending_visualization is None:
+            return
+
+        wandb_media = {}
+        pending = self._pending_visualization
+        self._pending_visualization = None
+        self._add_visualization(
+            pending,
+            wandb_media,
+            completed_step=self.step,
+        )
+        wandb.log(wandb_media, step=self.step)
+        video_count = sum(
+            key.startswith("visualization/") for key in wandb_media
+        )
+        print(
+            f"[WANDB_VIDEO] logged {video_count} training video(s) "
+            f"at step {self.step}",
+            flush=True,
+        )
+        del pending
 
     # ========================================================================
     # Diagnostic Logging System (rank 0 only, writes to diagnostics.log)
@@ -1493,20 +1810,37 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
         """Main training loop."""
         max_steps = self.config.get("max_steps", float('inf'))
         log_iters = self.config.log_iters
+        save_iters = int(self.config.get("save_iters", log_iters))
+        if save_iters <= 0:
+            raise ValueError(f"save_iters must be positive, got {save_iters}")
+        if save_iters % self.gradient_accumulation_steps != 0:
+            raise ValueError(
+                "save_iters must be divisible by gradient_accumulation_steps so "
+                "checkpoints are written only after complete optimizer updates."
+            )
+        if max_steps != float('inf') and max_steps % self.gradient_accumulation_steps != 0:
+            raise ValueError(
+                "max_steps must be divisible by gradient_accumulation_steps so the "
+                "final checkpoint does not contain partial accumulated gradients."
+            )
+        last_saved_step = None
 
         while self.step < max_steps:
             self.train_one_step()
+            self.step += 1
 
             # Checkpointing (save_iters defaults to log_iters for backward compat)
-            save_iters = int(self.config.get("save_iters", log_iters))
             if not self.config.get("no_save", False) and self.step % save_iters == 0:
                 self.save()
+                last_saved_step = self.step
                 torch.cuda.empty_cache()
                 # Ensure generator stays in train mode after save
                 # (FSDP state_dict gathering can disrupt internal state)
                 self.ode_model._generator.train()
 
             barrier()
+
+            self._flush_pending_visualization()
 
             if self._should_run_benchmark():
                 self._run_benchmark_and_log()
@@ -1522,10 +1856,11 @@ print(f"[HF_UPLOAD] uploaded {checkpoint_dir} -> {repo_id}/{path_in_repo}", flus
                 )
             self.previous_time = current_time
 
-            self.step += 1
-
         # Final save
-        if not self.config.get("no_save", False):
+        if (
+            not self.config.get("no_save", False)
+            and self.step != last_saved_step
+        ):
             self.save()
 
 
@@ -1538,17 +1873,21 @@ def main():
     parser.add_argument("--config_path", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed")
     parser.add_argument("--no_save", action="store_true", help="Disable checkpointing")
+    parser.add_argument("--resume_checkpoint", default=None)
 
     args = parser.parse_args()
 
     config = OmegaConf.load(args.config_path)
     if args.no_save:
         config.no_save = True
+    if args.resume_checkpoint:
+        config.resume_checkpoint = args.resume_checkpoint
 
     trainer = ODETrainer(config)
     trainer.train()
 
-    wandb.finish()
+    if trainer.is_main_process:
+        wandb.finish()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@
 #   VENV_PATH         - Python venv path (optional)
 #   NUM_CPUS          - CPUs per node for OMP threading (default: 128)
 #
-# Recommended: 32 GPUs (4 nodes x 8 GPUs), or 8 GPUs with gradient_accumulation_steps=4
+# This LTX-2.3 configuration requires 8 H200 GPUs with FSDP sharding.
 
 set -euo pipefail
 
@@ -44,6 +44,8 @@ else
 fi
 
 export PYTHONPATH="${DISTILLATION_ROOT}/src:${LTX2_ROOT}/packages/ltx-causal/src:${LTX2_ROOT}/packages/ltx-core/src:${LTX2_ROOT}/packages/ltx-pipelines/src${PYTHONPATH:+:${PYTHONPATH}}"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_PROGRESS_BARS="${HF_HUB_DISABLE_PROGRESS_BARS:-1}"
 
 # Distributed settings (auto-detect SLURM/scheduler env)
 NPROC_PER_NODE="${NPROC_PER_NODE:-${NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}}"

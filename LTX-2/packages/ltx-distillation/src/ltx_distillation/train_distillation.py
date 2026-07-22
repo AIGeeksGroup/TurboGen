@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import time
@@ -25,8 +26,15 @@ from ltx_distillation.util import (
     init_logging_folder,
     fsdp_wrap,
     fsdp_state_dict,
+    load_fsdp_state_dict,
     barrier,
-    cycle,
+    ResumableDataIterator,
+    ResumableDistributedSampler,
+    capture_rng_state,
+    restore_rng_state,
+    upload_checkpoint_to_hf,
+    validate_artifact_upload_config,
+    wandb_video_from_path,
 )
 
 
@@ -109,6 +117,8 @@ class Trainer:
 
     def __init__(self, config):
         self.config = config
+        self.training_stage = str(getattr(config, "training_stage", "dmd"))
+        validate_artifact_upload_config(config)
 
         # Initialize distributed environment
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -118,6 +128,13 @@ class Trainer:
         self.global_rank = rank
         self.world_size = world_size
         self.local_rank = local_rank
+
+        expected_world_size = int(getattr(config, "expected_world_size", 0))
+        if expected_world_size > 0 and self.world_size != expected_world_size:
+            raise RuntimeError(
+                f"Expected world_size={expected_world_size}, got {self.world_size}. "
+                "Launch this configuration with the required number of GPUs."
+            )
 
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
@@ -213,29 +230,23 @@ class Trainer:
         self._init_benchmark_prompts()
 
         self.step = 0
+        self.gradient_accumulation_steps = int(
+            getattr(config, "gradient_accumulation_steps", 1)
+        )
         self.max_grad_norm = getattr(config, "max_grad_norm", 10.0)
         self.log_iters = int(getattr(config, "log_iters", 0))
+        self.save_iters = int(getattr(config, "save_iters", self.log_iters))
+        self.last_saved_step = None
         self.layerwise_grad_log_interval = max(
             1, int(getattr(config, "layerwise_grad_log_interval", config.log_iters))
         )
         self.previous_time = None
 
-        # Resume from a causal DMD checkpoint (full state: generator + critic + step)
+        # Exact resume is restored only after models, optimizers, schedulers and
+        # the resumable DataLoader have all been constructed.
         resume_ckpt = getattr(config, "resume_checkpoint", None)
         if resume_ckpt:
-            if self.is_main_process:
-                print(f"[Resume] Loading causal DMD checkpoint from {resume_ckpt}")
-            ckpt = torch.load(resume_ckpt, map_location="cpu")
-            self.dmd.generator.load_state_dict(ckpt["generator"])
-            self.dmd.fake_score.load_state_dict(ckpt["critic"])
-            self.step = ckpt.get("step", 0)
-            if "generator_ema" in ckpt and self.ema_weight > 0:
-                from ltx_distillation.ema import EMA_FSDP
-                self.generator_ema = EMA_FSDP(self.dmd.generator, decay=self.ema_weight)
-                self.generator_ema.load_state_dict(ckpt["generator_ema"])
-                if self.is_main_process:
-                    print(f"[Resume] Loaded EMA state")
-                print(f"[Resume] Resumed at step {self.step}")
+            self._restore_training_state(str(resume_ckpt))
 
     def _create_lr_scheduler(self, optimizer):
         """Create learning rate scheduler based on config.
@@ -300,34 +311,36 @@ class Trainer:
         """Wrap models with FSDP for distributed training."""
         config = self.config
 
-        self.dmd.generator = fsdp_wrap(
-            self.dmd.generator,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy,
-        )
-
-        self.dmd.real_score = fsdp_wrap(
-            self.dmd.real_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy,
-        )
-
-        self.dmd.fake_score = fsdp_wrap(
-            self.dmd.fake_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy,
-        )
-
-        if getattr(config, "text_encoder_device", "cuda") != "cpu":
-            self.dmd.text_encoder = fsdp_wrap(
-                self.dmd.text_encoder,
+        if not getattr(config, "fsdp_wrap_during_model_init", False):
+            self.dmd.generator = fsdp_wrap(
+                self.dmd.generator,
                 sharding_strategy=config.sharding_strategy,
                 mixed_precision=config.mixed_precision,
-                wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
+                wrap_strategy=config.generator_fsdp_wrap_strategy,
             )
+
+            if getattr(self.dmd.real_score, "fp8_mode", None) != "static":
+                self.dmd.real_score = fsdp_wrap(
+                    self.dmd.real_score,
+                    sharding_strategy=config.sharding_strategy,
+                    mixed_precision=config.mixed_precision,
+                    wrap_strategy=config.real_score_fsdp_wrap_strategy,
+                )
+
+            self.dmd.fake_score = fsdp_wrap(
+                self.dmd.fake_score,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+            )
+
+            if getattr(config, "text_encoder_device", "cuda") != "cpu":
+                self.dmd.text_encoder = fsdp_wrap(
+                    self.dmd.text_encoder,
+                    sharding_strategy=config.sharding_strategy,
+                    mixed_precision=config.mixed_precision,
+                    wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
+                )
 
         # Keep VAEs on CPU to save GPU memory during training.
         # They are only needed for periodic visualization and benchmark decoding.
@@ -353,9 +366,45 @@ class Trainer:
                 config.data_path,
                 max_pair=int(1e8),
             )
+            if getattr(config, "require_ode_manifest", False):
+                manifest = getattr(dataset, "manifest", None)
+                if not isinstance(manifest, dict):
+                    raise RuntimeError(
+                        f"Required LTX-2.3 ODE manifest is missing: {config.data_path}"
+                    )
+                if manifest.get("format_version") != 4:
+                    raise RuntimeError(
+                        f"Unsupported ODE format: {manifest.get('format_version')}"
+                    )
+                if manifest.get("producer") != "omniforcing-ltx23-full-architecture-v2":
+                    raise RuntimeError(
+                        f"Unsupported ODE producer: {manifest.get('producer')}"
+                    )
+                teacher_checkpoint = os.path.realpath(
+                    str(manifest.get("teacher_checkpoint", ""))
+                )
+                expected_checkpoint = os.path.realpath(str(config.checkpoint_path))
+                if teacher_checkpoint != expected_checkpoint:
+                    raise RuntimeError(
+                        "ODE teacher checkpoint mismatch: "
+                        f"{teacher_checkpoint} != {expected_checkpoint}"
+                    )
+                generation_config = manifest.get("generation_config") or {}
+                if list(generation_config.get("denoising_step_list") or []) != list(
+                    config.denoising_step_list
+                ):
+                    raise RuntimeError("ODE denoising schedule does not match training")
+                for key, expected in {
+                    "video_height": int(config.video_height),
+                    "video_width": int(config.video_width),
+                }.items():
+                    if generation_config.get(key) != expected:
+                        raise RuntimeError(
+                            f"ODE {key} mismatch: {generation_config.get(key)} != {expected}"
+                        )
             collate_fn = collate_ode_data
 
-        sampler = torch.utils.data.distributed.DistributedSampler(
+        sampler = ResumableDistributedSampler(
             dataset,
             shuffle=True,
             drop_last=True,
@@ -366,9 +415,11 @@ class Trainer:
             batch_size=config.batch_size,
             sampler=sampler,
             collate_fn=collate_fn,
+            generator=torch.Generator(),
         )
 
-        self.dataloader = cycle(dataloader)
+        data_seed = int(config.seed) + self.global_rank * 1_000_003
+        self.dataloader = ResumableDataIterator(dataloader, seed=data_seed)
 
     def _init_benchmark_prompts(self):
         """
@@ -386,7 +437,17 @@ class Trainer:
         self.benchmark_seed = getattr(config, "benchmark_seed", 12345)
         self.benchmark_num_prompts = getattr(config, "benchmark_num_prompts", 2)
         self.benchmark_video_fps = getattr(config, "benchmark_video_fps", 24)
-        self.benchmark_audio_sample_rate = getattr(config, "benchmark_audio_sample_rate", 24000)
+        self.benchmark_audio_sample_rate = getattr(config, "benchmark_audio_sample_rate", 48000)
+        if self.dmd.audio_vae is not None and self.dmd.audio_vae.vocoder is not None:
+            model_audio_sample_rate = int(self.dmd.audio_vae.vocoder.output_sample_rate)
+            if int(self.benchmark_audio_sample_rate) != model_audio_sample_rate:
+                raise RuntimeError(
+                    "benchmark_audio_sample_rate does not match the checkpoint vocoder: "
+                    f"{self.benchmark_audio_sample_rate} != {model_audio_sample_rate}"
+                )
+        self.wandb_video_required = bool(
+            getattr(config, "wandb_video_required", False)
+        )
         self.benchmark_mode = str(getattr(config, "benchmark_mode", "bidirectional")).lower()
         if self.benchmark_mode not in {"bidirectional", "causal"}:
             if self.is_main_process:
@@ -446,31 +507,292 @@ class Trainer:
             self.dmd.audio_vae = self.dmd.audio_vae.to(device="cpu")
         torch.cuda.empty_cache()
 
+    def _resume_signature(self) -> dict:
+        config = self.config
+        scheduler_type = str(getattr(config, "scheduler_type", "constant"))
+        return {
+            "training_stage": self.training_stage,
+            "base_checkpoint": os.path.realpath(str(config.checkpoint_path)),
+            "data_path": os.path.realpath(str(config.data_path)),
+            "generator_task": str(config.generator_task),
+            "training_mode": str(getattr(config, "training_mode", "")),
+            "backward_simulation": bool(getattr(config, "backward_simulation", True)),
+            "denoising_step_list": list(config.denoising_step_list),
+            "batch_size": int(config.batch_size),
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "dfake_gen_update_ratio": int(config.dfake_gen_update_ratio),
+            "scheduler_type": scheduler_type,
+            "warmup_steps": int(getattr(config, "warmup_steps", 0)),
+            "scheduler_max_steps": (
+                int(config.max_steps) if scheduler_type != "constant" else None
+            ),
+            "min_lr": (
+                float(getattr(config, "min_lr", 1e-7))
+                if scheduler_type != "constant"
+                else None
+            ),
+            "generator_lr": float(getattr(config, "generator_lr", config.lr)),
+            "critic_lr": float(getattr(config, "critic_lr", config.lr)),
+            "beta1": float(config.beta1),
+            "beta2": float(config.beta2),
+            "beta1_critic": float(getattr(config, "beta1_critic", config.beta1)),
+            "beta2_critic": float(getattr(config, "beta2_critic", config.beta2)),
+            "weight_decay": float(getattr(config, "weight_decay", 0.0)),
+            "seed": int(config.seed),
+            "mixed_precision": bool(config.mixed_precision),
+            "sharding_strategy": str(config.sharding_strategy),
+            "generator_fsdp_wrap_strategy": str(config.generator_fsdp_wrap_strategy),
+            "fake_score_fsdp_wrap_strategy": str(config.fake_score_fsdp_wrap_strategy),
+            "teacher_fp8_mode": str(getattr(config, "teacher_fp8_mode", "")),
+            "trainable_fp8_mode": str(getattr(config, "trainable_fp8_mode", "")),
+            "distillation_loss": str(config.distillation_loss),
+            "denoising_loss_type": str(config.denoising_loss_type),
+            "num_train_timestep": int(config.num_train_timestep),
+            "disable_causal_mask": bool(getattr(config, "disable_causal_mask", False)),
+            "context_noise": float(getattr(config, "context_noise", 0.0)),
+            "num_frames": int(config.num_frames),
+            "video_height": int(config.video_height),
+            "video_width": int(config.video_width),
+            "num_frame_per_block": int(getattr(config, "num_frame_per_block", 0)),
+            "num_frame_per_block_first": int(
+                getattr(config, "num_frame_per_block_first", 0)
+            ),
+            "real_video_guidance_scale": float(config.real_video_guidance_scale),
+            "real_audio_guidance_scale": float(config.real_audio_guidance_scale),
+        }
+
+    @staticmethod
+    def _load_scheduler_state(scheduler, state, name: str) -> None:
+        if scheduler is None and state is None:
+            return
+        if scheduler is None or state is None:
+            raise RuntimeError(f"{name} scheduler changed across resume")
+        scheduler.load_state_dict(state)
+
+    def _restore_training_state(self, checkpoint_path: str) -> None:
+        checkpoint_path = os.path.realpath(checkpoint_path)
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        manifest_path = os.path.join(checkpoint_dir, "trainer_state.json")
+        if not os.path.isfile(manifest_path):
+            raise RuntimeError(
+                f"Exact resume metadata is missing: {manifest_path}. "
+                "Use a stage initialization checkpoint for a weights-only warm start."
+            )
+
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if int(manifest.get("format_version", 0)) != 2:
+            raise RuntimeError(
+                f"Unsupported DMD trainer-state format: {manifest.get('format_version')}"
+            )
+        if manifest.get("training_stage") != self.training_stage:
+            raise RuntimeError(
+                "Training stage changed across resume: "
+                f"{manifest.get('training_stage')} != {self.training_stage}"
+            )
+        if int(manifest.get("world_size", 0)) != self.world_size:
+            raise RuntimeError(
+                "Exact DMD resume requires the original FSDP topology: "
+                f"checkpoint world_size={manifest.get('world_size')}, "
+                f"current world_size={self.world_size}."
+            )
+
+        saved_signature = manifest.get("resume_signature")
+        current_signature = self._resume_signature()
+        if saved_signature != current_signature:
+            keys = sorted(set(saved_signature or {}) | set(current_signature))
+            mismatches = {
+                key: ((saved_signature or {}).get(key), current_signature.get(key))
+                for key in keys
+                if (saved_signature or {}).get(key) != current_signature.get(key)
+            }
+            raise RuntimeError(f"Training configuration changed across resume: {mismatches}")
+
+        rank_state_path = os.path.join(
+            checkpoint_dir, f"trainer_state_rank_{self.global_rank:05d}.pt"
+        )
+        if not os.path.isfile(rank_state_path):
+            raise RuntimeError(f"Exact resume shard is missing: {rank_state_path}")
+
+        if self.is_main_process:
+            print(f"[Resume] Loading exact {self.training_stage} state from {checkpoint_dir}")
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        if int(checkpoint.get("format_version", 0)) != 4:
+            raise RuntimeError(
+                f"Unsupported DMD model checkpoint format: {checkpoint.get('format_version')}"
+            )
+        saved_step = int(manifest.get("step", -1))
+        if int(checkpoint.get("step", -2)) != saved_step:
+            raise RuntimeError("model.pt and trainer_state.json have different steps")
+
+        load_fsdp_state_dict(self.dmd.generator, checkpoint["generator"], strict=True)
+        load_fsdp_state_dict(self.dmd.fake_score, checkpoint["critic"], strict=True)
+
+        ema_present = bool(manifest.get("ema_present", False))
+        if ema_present != ("generator_ema" in checkpoint):
+            raise RuntimeError("EMA metadata does not match model.pt")
+        if ema_present:
+            if self.ema_weight <= 0:
+                raise RuntimeError("Checkpoint contains EMA but EMA is disabled in the config")
+            from ltx_distillation.ema import EMA_FSDP
+
+            self.generator_ema = EMA_FSDP.from_state_dict(
+                checkpoint["generator_ema"], decay=self.ema_weight
+            )
+        del checkpoint
+
+        rank_state = torch.load(
+            rank_state_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        if int(rank_state.get("format_version", 0)) != 2:
+            raise RuntimeError(
+                f"Unsupported rank trainer-state format: {rank_state.get('format_version')}"
+            )
+        if int(rank_state.get("rank", -1)) != self.global_rank:
+            raise RuntimeError(f"Resume shard rank mismatch in {rank_state_path}")
+        if int(rank_state.get("world_size", 0)) != self.world_size:
+            raise RuntimeError(f"Resume shard world-size mismatch in {rank_state_path}")
+        if int(rank_state.get("step", -1)) != saved_step:
+            raise RuntimeError(f"Resume shard step mismatch in {rank_state_path}")
+
+        self.generator_optimizer.load_state_dict(rank_state["generator_optimizer"])
+        self.critic_optimizer.load_state_dict(rank_state["critic_optimizer"])
+        self._load_scheduler_state(
+            self.generator_scheduler,
+            rank_state.get("generator_scheduler"),
+            "generator",
+        )
+        self._load_scheduler_state(
+            self.critic_scheduler,
+            rank_state.get("critic_scheduler"),
+            "critic",
+        )
+        self.dataloader.load_state_dict(rank_state["data_iterator"])
+        restore_rng_state(rank_state["rng_state"], device=self.device)
+
+        self.step = saved_step
+        self.last_saved_step = saved_step
+        if self.generator_ema is None and self.ema_weight > 0 and self.step >= self.ema_start_step:
+            raise RuntimeError("Checkpoint is missing EMA state after ema_start_step")
+        max_steps = int(getattr(self.config, "max_steps", 0))
+        if max_steps <= self.step:
+            raise RuntimeError(
+                f"Resume max_steps must be greater than saved step {self.step}, got {max_steps}."
+            )
+        del rank_state
+        barrier()
+        if self.is_main_process:
+            print(
+                f"[Resume] Restored model, both AdamW states, schedulers, EMA, RNG "
+                f"and exact data cursor at step {self.step}."
+            )
+
     def save(self):
-        """Save checkpoint."""
+        """Save inference weights and exact same-topology training state."""
         print("Gathering distributed model states...")
 
         generator_state_dict = fsdp_state_dict(self.dmd.generator)
         critic_state_dict = fsdp_state_dict(self.dmd.fake_score)
+        checkpoint_dir = os.path.join(
+            self.output_path,
+            f"checkpoint_{self.step:06d}",
+        )
+        if self.is_main_process:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        barrier()
 
-        state_dict = {
-            "generator": generator_state_dict,
-            "critic": critic_state_dict,
+        saved_rng_state = capture_rng_state(device=self.device)
+        rank_state = {
+            "format_version": 2,
+            "rank": self.global_rank,
+            "world_size": self.world_size,
             "step": self.step,
+            "generator_optimizer": self.generator_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "generator_scheduler": (
+                self.generator_scheduler.state_dict()
+                if self.generator_scheduler is not None
+                else None
+            ),
+            "critic_scheduler": (
+                self.critic_scheduler.state_dict()
+                if self.critic_scheduler is not None
+                else None
+            ),
+            "data_iterator": self.dataloader.state_dict(),
+            "rng_state": saved_rng_state,
         }
-        if self.generator_ema is not None:
-            state_dict["generator_ema"] = self.generator_ema.state_dict()
+        rank_state_path = os.path.join(
+            checkpoint_dir, f"trainer_state_rank_{self.global_rank:05d}.pt"
+        )
+        rank_state_tmp = f"{rank_state_path}.tmp"
+        torch.save(rank_state, rank_state_tmp)
+        os.replace(rank_state_tmp, rank_state_path)
+        del rank_state
+        barrier()
 
         if self.is_main_process:
-            checkpoint_dir = os.path.join(
-                self.output_path,
-                f"checkpoint_{self.step:06d}"
-            )
-            os.makedirs(checkpoint_dir, exist_ok=True)
+            state_dict = {
+                "format_version": 4,
+                "checkpoint_kind": "dmd_generator_critic_with_distributed_training_state",
+                "training_stage": self.training_stage,
+                "optimizer_state_saved": True,
+                "resume_world_size": self.world_size,
+                "resume_state_pattern": "trainer_state_rank_{rank:05d}.pt",
+                "generator": generator_state_dict,
+                "critic": critic_state_dict,
+                "step": self.step,
+            }
+            if self.generator_ema is not None:
+                state_dict["generator_ema"] = self.generator_ema.state_dict()
 
             save_path = os.path.join(checkpoint_dir, "model.pt")
-            torch.save(state_dict, save_path)
+            save_tmp = f"{save_path}.tmp"
+            torch.save(state_dict, save_tmp)
+            os.replace(save_tmp, save_path)
+
+            manifest = {
+                "format_version": 2,
+                "training_stage": self.training_stage,
+                "step": self.step,
+                "world_size": self.world_size,
+                "optimizer": "AdamW",
+                "optimizer_state_saved": True,
+                "scheduler_state_saved": True,
+                "rng_state_saved": ["python", "numpy", "torch", "cuda"],
+                "ema_present": self.generator_ema is not None,
+                "rank_state_pattern": "trainer_state_rank_{rank:05d}.pt",
+                "data_iterator_resume": "exact_epoch_batch",
+                "resume_signature": self._resume_signature(),
+            }
+            manifest_path = os.path.join(checkpoint_dir, "trainer_state.json")
+            manifest_tmp = f"{manifest_path}.tmp"
+            with open(manifest_tmp, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(manifest_tmp, manifest_path)
             print(f"Checkpoint saved to {save_path}")
+            upload_checkpoint_to_hf(
+                checkpoint_dir,
+                self.config,
+                output_path=self.output_path,
+            )
+
+        barrier()
+        del generator_state_dict, critic_state_dict
+        # Checkpoint serialization and remote upload must not perturb the next
+        # training step relative to an uninterrupted run.
+        restore_rng_state(saved_rng_state, device=self.device)
+        del saved_rng_state
+        self.last_saved_step = self.step
 
     @staticmethod
     def _to_scalar(value):
@@ -612,6 +934,8 @@ class Trainer:
                     self.dmd.generator.parameters(), self.max_grad_norm
                 )
             self.generator_optimizer.step()
+            from ltx_distillation.util import refresh_fp8_training_scales
+            refresh_fp8_training_scales(self.dmd.generator)
 
             # EMA update
             if self.generator_ema is not None:
@@ -661,19 +985,11 @@ class Trainer:
                 self.dmd.fake_score.parameters(), self.max_grad_norm
             )
         self.critic_optimizer.step()
+        from ltx_distillation.util import refresh_fp8_training_scales
+        refresh_fp8_training_scales(self.dmd.fake_score)
 
-        # Benchmark: periodic 4-step inference visualization
-        # ALL ranks must participate because FSDP forward passes require
-        # collective communication across all ranks.
-        BENCHMARK = (
-            self.benchmark_enabled
-            and len(self.benchmark_prompts) > 0
-            and self.step % self.benchmark_iters == 0
-            and not getattr(config, "no_visualize", False)
-        )
-
-        if BENCHMARK:
-            self._run_benchmark_and_log()
+        # From this point onward, self.step is the number of completed updates.
+        self.step += 1
 
         # Logging (all scalars, no GPU tensors)
         if self.is_main_process:
@@ -857,10 +1173,15 @@ class Trainer:
 
             for idx in range(num_prompts):
                 sample_path = os.path.join(step_dir, f"sample_{idx}.mp4")
-                if os.path.exists(sample_path):
-                    benchmark_wandb_dict[f"benchmark/sample_{idx}"] = wandb.Video(
-                        sample_path, fps=self.benchmark_video_fps, format="mp4"
-                    )
+                media_key = f"benchmark/sample_{idx}"
+                video_media = wandb_video_from_path(
+                    sample_path,
+                    fps=self.benchmark_video_fps,
+                    key=media_key,
+                    required=self.wandb_video_required,
+                )
+                if video_media is not None:
+                    benchmark_wandb_dict[media_key] = video_media
                     prompt_rows.append(
                         [idx, self.benchmark_prompts[idx], sample_path]
                     )
@@ -874,6 +1195,15 @@ class Trainer:
 
             if benchmark_wandb_dict:
                 wandb.log(benchmark_wandb_dict, step=self.step)
+                video_count = sum(
+                    key.startswith("benchmark/sample_")
+                    for key in benchmark_wandb_dict
+                )
+                print(
+                    f"[WANDB_VIDEO] logged {video_count} benchmark video(s) "
+                    f"at step {self.step}",
+                    flush=True,
+                )
 
             print(
                 f"[Benchmark] Step {self.step}: {num_prompts} video(s) | "
@@ -882,6 +1212,15 @@ class Trainer:
             )
 
         barrier()
+
+    def _should_run_benchmark(self) -> bool:
+        return (
+            self.benchmark_enabled
+            and len(self.benchmark_prompts) > 0
+            and self.benchmark_iters > 0
+            and self.step % self.benchmark_iters == 0
+            and not getattr(self.config, "no_visualize", False)
+        )
 
     def _decode_and_save_sample(
         self,
@@ -979,14 +1318,37 @@ class Trainer:
         while True:
             self.train_one_step()
 
+            # Complete all state transitions for this step before checkpointing.
+            if (
+                self.generator_ema is None
+                and self.ema_weight > 0
+                and self.step >= self.ema_start_step
+            ):
+                from ltx_distillation.ema import EMA_FSDP
+                if self.is_main_process:
+                    print(f"[EMA] Initializing EMA with decay={self.ema_weight} at step {self.step}")
+                self.generator_ema = EMA_FSDP(self.dmd.generator, decay=self.ema_weight)
+
+            if self.generator_scheduler is not None:
+                self.generator_scheduler.step()
+            if self.critic_scheduler is not None:
+                self.critic_scheduler.step()
+
             # Save checkpoint
             if (
                 not getattr(self.config, "no_save", False)
-                and self.log_iters > 0
-                and self.step % self.log_iters == 0
+                and self.save_iters > 0
+                and self.step % self.save_iters == 0
             ):
                 self.save()
                 torch.cuda.empty_cache()
+
+            barrier()
+
+            # Persist and upload the checkpoint before a required video upload
+            # can fail the shared 500-step artifact interval.
+            if self._should_run_benchmark():
+                self._run_benchmark_and_log()
 
             barrier()
 
@@ -999,31 +1361,15 @@ class Trainer:
                 )
             self.previous_time = current_time
 
-            self.step += 1
-
-            # Lazy EMA initialization at ema_start_step
-            if (
-                self.generator_ema is None
-                and self.ema_weight > 0
-                and self.step >= self.ema_start_step
-            ):
-                from ltx_distillation.ema import EMA_FSDP
-                if self.is_main_process:
-                    print(f"[EMA] Initializing EMA with decay={self.ema_weight} at step {self.step}")
-                self.generator_ema = EMA_FSDP(self.dmd.generator, decay=self.ema_weight)
-
-            # Step LR schedulers based on global step (both stay synchronized)
-            if self.generator_scheduler is not None:
-                self.generator_scheduler.step(self.step)
-            if self.critic_scheduler is not None:
-                self.critic_scheduler.step(self.step)
-
             # Optional: max steps limit
             max_steps = getattr(self.config, "max_steps", None)
             if max_steps and self.step >= max_steps:
                 break
 
-        if not getattr(self.config, "no_save", False):
+        if (
+            not getattr(self.config, "no_save", False)
+            and self.last_saved_step != self.step
+        ):
             self.save()
         if self.is_main_process:
             wandb.finish()
@@ -1035,12 +1381,15 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--no_save", action="store_true")
     parser.add_argument("--no_visualize", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None)
 
     args = parser.parse_args()
 
     config = OmegaConf.load(args.config_path)
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
+    if args.resume_checkpoint:
+        config.resume_checkpoint = args.resume_checkpoint
 
     trainer = Trainer(config)
     trainer.train()

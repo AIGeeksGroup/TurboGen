@@ -42,10 +42,19 @@ def apply_interleaved_rotary_emb(
 def apply_split_rotary_emb(
     input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
 ) -> torch.Tensor:
+    if sin_freqs.shape != cos_freqs.shape:
+        raise ValueError(
+            f"Split RoPE cos/sin shapes differ: {tuple(cos_freqs.shape)} vs {tuple(sin_freqs.shape)}"
+        )
     needs_reshape = False
     if input_tensor.ndim != 4 and cos_freqs.ndim == 4:
-        b, h, t, _ = cos_freqs.shape
-        input_tensor = input_tensor.reshape(b, t, h, -1).swapaxes(1, 2)
+        freq_batch, heads, _, _ = cos_freqs.shape
+        input_batch = input_tensor.shape[0]
+        if freq_batch not in (1, input_batch):
+            raise ValueError(
+                f"Split RoPE frequency batch {freq_batch} cannot broadcast to input batch {input_batch}"
+            )
+        input_tensor = input_tensor.unflatten(-1, (heads, -1)).transpose(1, 2)
         needs_reshape = True
 
     split_input = rearrange(input_tensor, "... (d r) -> ... d r", d=2)
@@ -61,7 +70,7 @@ def apply_split_rotary_emb(
 
     output = rearrange(output, "... d r -> ... (d r)")
     if needs_reshape:
-        output = output.swapaxes(1, 2).reshape(b, t, -1)
+        output = output.transpose(1, 2).flatten(-2)
 
     return output
 

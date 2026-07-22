@@ -46,6 +46,11 @@ from ltx_causal.rope.causal_rope import (
     CausalRopeType,
     causal_precompute_freqs_cis,
 )
+from ltx_causal.checkpoint import (
+    load_checkpoint_config,
+    load_checkpoint_state_dict,
+    remap_transformer_state_dict,
+)
 
 
 # ============================================================================
@@ -72,6 +77,8 @@ class CausalLTXModelConfig:
     # Patch embedding (LTX-2 uses patch_size=1 with nn.Linear)
     in_channels: int = 128
     out_channels: int = 128
+    audio_in_channels: int = 128
+    audio_out_channels: int = 128
     patch_size: Tuple[int, int, int] = (1, 1, 1)
 
     # Caption (text) projection
@@ -88,8 +95,18 @@ class CausalLTXModelConfig:
     timestep_scale_multiplier: int = 1000
     av_ca_timestep_scale_multiplier: int = 1
 
+    # Native LTX-2.3 positional-encoding metadata.
+    use_middle_indices_grid: bool = True
+    double_precision_rope: bool = False
+    causal_temporal_positioning: bool = True
+
     # Normalization
     norm_eps: float = 1e-6
+
+    # LTX-2.3 architecture features.  Both are stored in checkpoint metadata
+    # and must match the base checkpoint exactly.
+    apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
 
     # Causal generation: 4-3-3-3-... layout (Block 0 = 4 video frames + 26 audio,
     # subsequent blocks = 3 video + 25 audio).
@@ -110,6 +127,57 @@ class CausalLTXModelConfig:
     # No learnable parameters 鈥?purely structural rescaling.
     enable_causal_log_rescale: bool = False
 
+    @classmethod
+    def from_checkpoint_config(cls, checkpoint_config: Dict[str, Any], **overrides) -> "CausalLTXModelConfig":
+        """Construct the causal architecture from LTX checkpoint metadata."""
+        raw = dict(checkpoint_config or {})
+        transformer = raw.pop("transformer", None)
+        if isinstance(transformer, dict):
+            raw = {**transformer, **raw}
+
+        # LTX-2.3 (22B) applies this projection inside the Gemma feature
+        # extractor. Older 19B checkpoints omit the flag and keep it here.
+        use_caption_projection = not raw.get("caption_proj_before_connector", False)
+        rope_value = raw.get("rope_type", CausalRopeType.INTERLEAVED.value)
+        rope_type = rope_value if isinstance(rope_value, CausalRopeType) else CausalRopeType(rope_value)
+        video_heads = raw.get("num_attention_heads", 32)
+        video_d_head = raw.get("attention_head_dim", 128)
+        audio_heads = raw.get("audio_num_attention_heads", 32)
+        audio_d_head = raw.get("audio_attention_head_dim", 64)
+
+        values = {
+            "num_layers": raw.get("num_layers", 48),
+            "video_dim": video_heads * video_d_head,
+            "audio_dim": audio_heads * audio_d_head,
+            "video_heads": video_heads,
+            "audio_heads": audio_heads,
+            "video_d_head": video_d_head,
+            "audio_d_head": audio_d_head,
+            "cross_attention_dim": raw.get("cross_attention_dim", 4096),
+            "audio_cross_attention_dim": raw.get("audio_cross_attention_dim", 2048),
+            "in_channels": raw.get("in_channels", 128),
+            "out_channels": raw.get("out_channels", 128),
+            "audio_in_channels": raw.get("audio_in_channels", 128),
+            "audio_out_channels": raw.get("audio_out_channels", 128),
+            "caption_channels": raw.get("caption_channels", 3840),
+            "audio_caption_channels": raw.get("audio_caption_channels"),
+            "use_caption_projection": use_caption_projection,
+            "pe_theta": raw.get("positional_embedding_theta", 10000.0),
+            "pe_max_pos": tuple(raw.get("positional_embedding_max_pos", [20, 2048, 2048])),
+            "audio_pe_max_pos": tuple(raw.get("audio_positional_embedding_max_pos", [20])),
+            "timestep_scale_multiplier": raw.get("timestep_scale_multiplier", 1000),
+            "av_ca_timestep_scale_multiplier": raw.get("av_ca_timestep_scale_multiplier", 1),
+            "use_middle_indices_grid": raw.get("use_middle_indices_grid", True),
+            "double_precision_rope": raw.get("frequencies_precision", False) == "float64",
+            "causal_temporal_positioning": raw.get("causal_temporal_positioning", True),
+            "norm_eps": raw.get("norm_eps", 1e-6),
+            "apply_gated_attention": raw.get("apply_gated_attention", False),
+            "cross_attention_adaln": raw.get("cross_attention_adaln", False),
+            "rope_type": rope_type,
+        }
+        values.update(overrides)
+        return cls(**values)
+
 
 # ============================================================================
 # CausalLTXModel
@@ -125,8 +193,8 @@ class CausalLTXModel(nn.Module):
     Module name mapping to original LTXModel:
         patchify_proj           鈫?nn.Linear(128, 4096)
         audio_patchify_proj     鈫?nn.Linear(128, 2048)
-        adaln_single            鈫?AdaLayerNormSingle(4096, coefficient=6)
-        audio_adaln_single      鈫?AdaLayerNormSingle(2048, coefficient=6)
+        adaln_single            -> AdaLayerNormSingle(4096, coefficient=6 or 9)
+        audio_adaln_single      -> AdaLayerNormSingle(2048, coefficient=6 or 9)
         caption_projection      鈫?PixArtAlphaTextProjection(3840, 4096)
         audio_caption_projection 鈫?PixArtAlphaTextProjection(3840, 2048)
         av_ca_video_scale_shift_adaln_single 鈫?AdaLayerNormSingle(4096, coefficient=4)
@@ -145,6 +213,10 @@ class CausalLTXModel(nn.Module):
     def __init__(self, config: CausalLTXModelConfig):
         super().__init__()
         self.config = config
+        if not config.use_middle_indices_grid:
+            raise ValueError("Causal LTX currently requires use_middle_indices_grid=True")
+        if not config.causal_temporal_positioning:
+            raise ValueError("Causal LTX currently requires causal_temporal_positioning=True")
 
         # Store key parameters for easy access
         self.timestep_scale_multiplier = config.timestep_scale_multiplier
@@ -152,12 +224,24 @@ class CausalLTXModel(nn.Module):
 
         # === Patch Embedding (Linear, matching original) ===
         self.patchify_proj = nn.Linear(config.in_channels, config.video_dim, bias=True)
-        self.audio_patchify_proj = nn.Linear(config.in_channels, config.audio_dim, bias=True)
+        self.audio_patchify_proj = nn.Linear(config.audio_in_channels, config.audio_dim, bias=True)
 
         # === AdaLN Timestep Embedding ===
-        # Main AdaLN: outputs [N, 6*D] for per-block shift/scale/gate + [N, D] embedded_timestep
-        self.adaln_single = AdaLayerNormSingle(config.video_dim, embedding_coefficient=6)
-        self.audio_adaln_single = AdaLayerNormSingle(config.audio_dim, embedding_coefficient=6)
+        # LTX-2.3 uses 9 values: six for self-attention/MLP and three for
+        # text cross-attention. Legacy LTX-2 checkpoints use six.
+        adaln_values = 9 if config.cross_attention_adaln else 6
+        self.adaln_single = AdaLayerNormSingle(config.video_dim, embedding_coefficient=adaln_values)
+        self.audio_adaln_single = AdaLayerNormSingle(config.audio_dim, embedding_coefficient=adaln_values)
+        self.prompt_adaln_single = (
+            AdaLayerNormSingle(config.video_dim, embedding_coefficient=2)
+            if config.cross_attention_adaln
+            else None
+        )
+        self.audio_prompt_adaln_single = (
+            AdaLayerNormSingle(config.audio_dim, embedding_coefficient=2)
+            if config.cross_attention_adaln
+            else None
+        )
 
         # === Caption (Text) Projection ===
         self.caption_projection = (
@@ -198,6 +282,8 @@ class CausalLTXModel(nn.Module):
             heads=config.video_heads,
             d_head=config.video_d_head,
             context_dim=config.cross_attention_dim,
+            apply_gated_attention=config.apply_gated_attention,
+            cross_attention_adaln=config.cross_attention_adaln,
         )
 
         audio_config = TransformerConfig(
@@ -205,6 +291,8 @@ class CausalLTXModel(nn.Module):
             heads=config.audio_heads,
             d_head=config.audio_d_head,
             context_dim=config.audio_cross_attention_dim,
+            apply_gated_attention=config.apply_gated_attention,
+            cross_attention_adaln=config.cross_attention_adaln,
         )
 
         # Name must be `transformer_blocks` to match original state_dict
@@ -232,7 +320,7 @@ class CausalLTXModel(nn.Module):
         self.audio_norm_out = nn.LayerNorm(
             config.audio_dim, elementwise_affine=False, eps=config.norm_eps
         )
-        self.audio_proj_out = nn.Linear(config.audio_dim, config.out_channels)
+        self.audio_proj_out = nn.Linear(config.audio_dim, config.audio_out_channels)
 
         # === Mask Builder ===
         self.mask_builder = AVCausalMaskBuilder(
@@ -248,6 +336,32 @@ class CausalLTXModel(nn.Module):
     # ================================================================
     # Timestep Processing
     # ================================================================
+
+    @staticmethod
+    def _expand_temporal_rope_to_tokens(
+        positional_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        frame_seqlen: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Repeat one temporal RoPE value over each frame's spatial tokens.
+
+        Interleaved RoPE uses ``[B, F, D]`` while LTX-2.3 split RoPE uses
+        ``[B, H, F, D/2]``. Keeping the head axis intact is required for the
+        split attention implementation and for checkpoint-compatible values.
+        """
+        expanded = []
+        for frequencies in positional_embeddings:
+            if frequencies.ndim == 3:
+                values = frequencies.unsqueeze(2).expand(-1, -1, frame_seqlen, -1)
+                expanded.append(values.reshape(values.shape[0], -1, values.shape[-1]))
+            elif frequencies.ndim == 4:
+                values = frequencies.unsqueeze(3).expand(-1, -1, -1, frame_seqlen, -1)
+                expanded.append(values.reshape(values.shape[0], values.shape[1], -1, values.shape[-1]))
+            else:
+                raise ValueError(
+                    "Temporal RoPE must have shape [B,F,D] or [B,H,F,D], "
+                    f"got {tuple(frequencies.shape)}"
+                )
+        return expanded[0], expanded[1]
 
     def _prepare_timestep(
         self,
@@ -280,9 +394,32 @@ class CausalLTXModel(nn.Module):
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
         return timestep_6d, embedded_timestep
 
+    def _prepare_prompt_timestep(
+        self,
+        sigma: torch.Tensor,
+        prompt_adaln: Optional[AdaLayerNormSingle],
+        batch_size: int,
+        hidden_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Build the scalar prompt AdaLN embedding used by LTX-2.3."""
+        if prompt_adaln is None:
+            return None
+        if sigma.ndim != 1 or sigma.shape[0] != batch_size:
+            raise ValueError(
+                f"Prompt sigma must have shape [{batch_size}], got {tuple(sigma.shape)}"
+            )
+        prompt_timestep, _ = self._prepare_timestep(
+            sigma,
+            prompt_adaln,
+            batch_size,
+            hidden_dtype,
+        )
+        return prompt_timestep
+
     def _prepare_cross_attention_timestep(
         self,
-        timestep: torch.Tensor,
+        modality_timestep: torch.Tensor,
+        cross_modality_sigma: torch.Tensor,
         cross_scale_shift_adaln: AdaLayerNormSingle,
         cross_gate_adaln: AdaLayerNormSingle,
         batch_size: int,
@@ -293,7 +430,8 @@ class CausalLTXModel(nn.Module):
         Matches MultiModalTransformerArgsPreprocessor._prepare_cross_attention_timestep.
 
         Args:
-            timestep: [B] or [B, F] raw sigma values
+            modality_timestep: [B] or [B, F] raw per-token sigma values
+            cross_modality_sigma: [B] scalar sigma from the other modality
             cross_scale_shift_adaln: AdaLN for scale/shift (coefficient=4)
             cross_gate_adaln: AdaLN for gate (coefficient=1)
             batch_size: Batch size
@@ -304,7 +442,13 @@ class CausalLTXModel(nn.Module):
                 scale_shift_timestep: [B, L, 4*D]
                 gate_timestep: [B, L, D]
         """
-        timestep_scaled = timestep * self.timestep_scale_multiplier
+        if cross_modality_sigma.ndim != 1 or cross_modality_sigma.shape[0] != batch_size:
+            raise ValueError(
+                "Cross-modality sigma must have shape "
+                f"[{batch_size}], got {tuple(cross_modality_sigma.shape)}"
+            )
+
+        timestep_scaled = modality_timestep * self.timestep_scale_multiplier
         av_ca_factor = self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
 
         scale_shift_timestep, _ = cross_scale_shift_adaln(
@@ -316,7 +460,11 @@ class CausalLTXModel(nn.Module):
         )
 
         gate_timestep, _ = cross_gate_adaln(
-            timestep_scaled.flatten() * av_ca_factor,
+            (
+                cross_modality_sigma
+                * self.timestep_scale_multiplier
+                * av_ca_factor
+            ).flatten(),
             hidden_dtype=hidden_dtype,
         )
         gate_timestep = gate_timestep.view(
@@ -411,6 +559,8 @@ class CausalLTXModel(nn.Module):
         video_context_mask: Optional[torch.Tensor] = None,
         audio_context_mask: Optional[torch.Tensor] = None,
         audio_timesteps: Optional[torch.Tensor] = None,
+        video_sigma: Optional[torch.Tensor] = None,
+        audio_sigma: Optional[torch.Tensor] = None,
         masks: Optional[Dict[str, Any]] = None,
         # KV-cache path: when provided, dispatches to the incremental
         # forward_with_cache codepath. This MUST go through forward() so
@@ -454,6 +604,8 @@ class CausalLTXModel(nn.Module):
                 video_context_mask=video_context_mask,
                 audio_context_mask=audio_context_mask,
                 audio_timesteps=audio_timesteps,
+                video_sigma=video_sigma,
+                audio_sigma=audio_sigma,
             )
 
         B = video_latent.shape[0]
@@ -488,26 +640,39 @@ class CausalLTXModel(nn.Module):
         # === Timestep Embedding via AdaLayerNormSingle ===
         # Video timestep
         video_ts = timesteps  # [B] or [B, F_v]
+        if video_sigma is None:
+            video_sigma = video_ts.reshape(B, -1).amax(dim=1)
+        if audio_sigma is None:
+            audio_sigma_source = audio_timesteps if audio_timesteps is not None else video_ts
+            audio_sigma = audio_sigma_source.reshape(B, -1).amax(dim=1)
         video_timestep_6d, video_embedded_ts = self._prepare_timestep(
             video_ts, self.adaln_single, B, hidden_dtype
         )
+        video_prompt_ts = self._prepare_prompt_timestep(
+            video_sigma, self.prompt_adaln_single, B, hidden_dtype
+        )
 
         # Audio timestep (defaults to video timestep if not provided)
-        audio_ts = audio_timesteps if audio_timesteps is not None else timesteps
+        audio_ts = audio_timesteps if audio_timesteps is not None else audio_sigma
 
         audio_timestep_6d, audio_embedded_ts = self._prepare_timestep(
             audio_ts, self.audio_adaln_single, B, hidden_dtype
+        )
+        audio_prompt_ts = self._prepare_prompt_timestep(
+            audio_sigma, self.audio_prompt_adaln_single, B, hidden_dtype
         )
 
         # === Cross-Attention Timesteps ===
         video_cross_ss, video_cross_gate = self._prepare_cross_attention_timestep(
             video_ts,
+            audio_sigma,
             self.av_ca_video_scale_shift_adaln_single,
             self.av_ca_a2v_gate_adaln_single,
             B, hidden_dtype,
         )
         audio_cross_ss, audio_cross_gate = self._prepare_cross_attention_timestep(
             audio_ts,
+            video_sigma,
             self.av_ca_audio_scale_shift_adaln_single,
             self.av_ca_v2a_gate_adaln_single,
             B, hidden_dtype,
@@ -560,15 +725,19 @@ class CausalLTXModel(nn.Module):
             video_grid_sizes, self.config.video_d_head * self.config.video_heads,
             theta=self.config.pe_theta, max_pos=list(self.config.pe_max_pos),
             start_frame=0, rope_type=self.config.rope_type,
+            num_attention_heads=self.config.video_heads,
             device=device, dtype=video_x.dtype,
+            double_precision=self.config.double_precision_rope,
         )
 
         audio_pe = causal_precompute_freqs_cis(
             audio_grid_sizes, self.config.audio_d_head * self.config.audio_heads,
             theta=self.config.pe_theta, max_pos=list(self.config.audio_pe_max_pos),
             start_frame=0, rope_type=self.config.rope_type,
+            num_attention_heads=self.config.audio_heads,
             device=device, dtype=audio_x.dtype,
             is_audio=True,
+            double_precision=self.config.double_precision_rope,
         )
 
         # === Cross-attention RoPE ===
@@ -589,16 +758,16 @@ class CausalLTXModel(nn.Module):
             max_pos=[cross_pe_max_pos],
             start_frame=0,
             rope_type=self.config.rope_type,
+            num_attention_heads=self.config.audio_heads,
             device=device, dtype=video_x.dtype,
             is_audio=False,  # Video temporal conversion
+            double_precision=self.config.double_precision_rope,
         )
-        # Expand temporal PE to full video sequence: each frame's tokens share same temporal PE
-        # video_cross_pe: [B, F_v, D] 鈫?need [B, F_v*H*W, D]
-        video_cross_pe = (
-            video_cross_pe[0].unsqueeze(2).expand(-1, -1, frame_seqlen, -1)
-            .reshape(1, -1, video_cross_pe[0].shape[-1]),
-            video_cross_pe[1].unsqueeze(2).expand(-1, -1, frame_seqlen, -1)
-            .reshape(1, -1, video_cross_pe[1].shape[-1]),
+        # Expand temporal PE to full video sequence: each frame's tokens share
+        # one temporal value while preserving split-RoPE's head dimension.
+        video_cross_pe = self._expand_temporal_rope_to_tokens(
+            video_cross_pe,
+            frame_seqlen,
         )
 
         # Audio cross-PE: temporal positions from audio grid (1D, audio temporal)
@@ -613,8 +782,10 @@ class CausalLTXModel(nn.Module):
             max_pos=[cross_pe_max_pos],
             start_frame=0,
             rope_type=self.config.rope_type,
+            num_attention_heads=self.config.audio_heads,
             device=device, dtype=audio_x.dtype,
             is_audio=True,  # Audio temporal conversion
+            double_precision=self.config.double_precision_rope,
         )
 
         # === Prepare Transformer Args ===
@@ -629,6 +800,7 @@ class CausalLTXModel(nn.Module):
             cross_positional_embeddings=video_cross_pe,
             cross_scale_shift_timestep=video_cross_ss,
             cross_gate_timestep=video_cross_gate,
+            prompt_timestep=video_prompt_ts,
             self_attn_log_scale=log_scales['video_self_scale'].to(hidden_dtype) if log_scales else None,
             cross_attn_log_scale=log_scales['a2v_scale'].to(hidden_dtype) if log_scales else None,
         )
@@ -644,6 +816,7 @@ class CausalLTXModel(nn.Module):
             cross_positional_embeddings=audio_cross_pe,
             cross_scale_shift_timestep=audio_cross_ss,
             cross_gate_timestep=audio_cross_gate,
+            prompt_timestep=audio_prompt_ts,
             self_attn_log_scale=log_scales['audio_self_scale'].to(hidden_dtype) if log_scales else None,
             cross_attn_log_scale=log_scales['v2a_scale'].to(hidden_dtype) if log_scales else None,
         )
@@ -702,44 +875,27 @@ class CausalLTXModel(nn.Module):
             Initialized CausalLTXModel with loaded weights
         """
         if config is None:
-            config = CausalLTXModelConfig()
+            checkpoint_config = load_checkpoint_config(checkpoint_path)
+            if not checkpoint_config:
+                raise ValueError(
+                    "Checkpoint metadata is unavailable; pass an explicit "
+                    "CausalLTXModelConfig instead of relying on legacy defaults."
+                )
+            config = CausalLTXModelConfig.from_checkpoint_config(checkpoint_config)
 
         model = cls(config)
         model = model.to(device=device, dtype=dtype)
 
-        # Load checkpoint
-        if checkpoint_path.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            state_dict = load_file(checkpoint_path)
-        else:
-            state_dict = torch.load(checkpoint_path, map_location=device)
-
-        # Forward-compatible: strip legacy audio_sink_tokens entry if present.
-        for legacy_key in list(state_dict.keys()):
-            if 'audio_sink_tokens' in legacy_key:
-                state_dict.pop(legacy_key)
-
-        # Load with strict=False to ignore mask_builder buffers.
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-        expected_missing = ['mask_builder']
-        real_missing = [
-            key for key in missing
-            if not any(pat in key for pat in expected_missing)
-        ]
-        if real_missing:
+        state_dict = remap_transformer_state_dict(
+            load_checkpoint_state_dict(checkpoint_path),
+            target_prefix="",
+        )
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
             raise RuntimeError(
-                f"Missing keys in checkpoint: {real_missing[:10]}. "
-                f"Total missing: {len(real_missing)}. "
-                f"This likely means the checkpoint is incompatible with CausalLTXModel."
-            )
-
-        if unexpected:
-            raise RuntimeError(
-                f"Unexpected keys in checkpoint: {unexpected[:10]}. "
-                f"Total unexpected: {len(unexpected)}. "
-                f"This likely means the checkpoint is incompatible with CausalLTXModel."
-            )
+                f"Checkpoint is not architecture-compatible with CausalLTXModel: {checkpoint_path}"
+            ) from exc
 
         return model
 
@@ -857,6 +1013,8 @@ class CausalLTXModel(nn.Module):
         video_context_mask: Optional[torch.Tensor] = None,
         audio_context_mask: Optional[torch.Tensor] = None,
         audio_timesteps: Optional[torch.Tensor] = None,
+        video_sigma: Optional[torch.Tensor] = None,
+        audio_sigma: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Causal autoregressive forward for ONE block, with KV caches.
 
@@ -901,23 +1059,36 @@ class CausalLTXModel(nn.Module):
 
         # === Timestep embedding ===
         video_ts = timesteps
+        if video_sigma is None:
+            video_sigma = video_ts.reshape(B, -1).amax(dim=1)
+        if audio_sigma is None:
+            audio_sigma_source = audio_timesteps if audio_timesteps is not None else video_ts
+            audio_sigma = audio_sigma_source.reshape(B, -1).amax(dim=1)
         video_timestep_6d, video_embedded_ts = self._prepare_timestep(
             video_ts, self.adaln_single, B, hidden_dtype
         )
-        audio_ts = audio_timesteps if audio_timesteps is not None else timesteps
+        video_prompt_ts = self._prepare_prompt_timestep(
+            video_sigma, self.prompt_adaln_single, B, hidden_dtype
+        )
+        audio_ts = audio_timesteps if audio_timesteps is not None else audio_sigma
         audio_timestep_6d, audio_embedded_ts = self._prepare_timestep(
             audio_ts, self.audio_adaln_single, B, hidden_dtype
+        )
+        audio_prompt_ts = self._prepare_prompt_timestep(
+            audio_sigma, self.audio_prompt_adaln_single, B, hidden_dtype
         )
 
         # === Cross-attention timesteps ===
         video_cross_ss, video_cross_gate = self._prepare_cross_attention_timestep(
             video_ts,
+            audio_sigma,
             self.av_ca_video_scale_shift_adaln_single,
             self.av_ca_a2v_gate_adaln_single,
             B, hidden_dtype,
         )
         audio_cross_ss, audio_cross_gate = self._prepare_cross_attention_timestep(
             audio_ts,
+            video_sigma,
             self.av_ca_audio_scale_shift_adaln_single,
             self.av_ca_v2a_gate_adaln_single,
             B, hidden_dtype,
@@ -934,14 +1105,18 @@ class CausalLTXModel(nn.Module):
             video_grid_sizes, self.config.video_d_head * self.config.video_heads,
             theta=self.config.pe_theta, max_pos=list(self.config.pe_max_pos),
             start_frame=current_video_start_frame, rope_type=self.config.rope_type,
+            num_attention_heads=self.config.video_heads,
             device=device, dtype=video_x.dtype,
+            double_precision=self.config.double_precision_rope,
         )
         audio_pe = causal_precompute_freqs_cis(
             audio_grid_sizes, self.config.audio_d_head * self.config.audio_heads,
             theta=self.config.pe_theta, max_pos=list(self.config.audio_pe_max_pos),
             start_frame=current_audio_start_frame, rope_type=self.config.rope_type,
+            num_attention_heads=self.config.audio_heads,
             device=device, dtype=audio_x.dtype,
             is_audio=True,
+            double_precision=self.config.double_precision_rope,
         )
 
         # === Cross-PE for current block ===
@@ -958,15 +1133,16 @@ class CausalLTXModel(nn.Module):
             max_pos=[cross_pe_max_pos],
             start_frame=current_video_start_frame,
             rope_type=self.config.rope_type,
+            num_attention_heads=self.config.audio_heads,
             device=device, dtype=video_x.dtype,
             is_audio=False,
+            double_precision=self.config.double_precision_rope,
         )
-        # Expand temporal -> per-spatial-token
-        video_cross_pe = (
-            video_cross_pe[0].unsqueeze(2).expand(-1, -1, frame_seqlen, -1)
-            .reshape(1, -1, video_cross_pe[0].shape[-1]),
-            video_cross_pe[1].unsqueeze(2).expand(-1, -1, frame_seqlen, -1)
-            .reshape(1, -1, video_cross_pe[1].shape[-1]),
+        # Expand temporal -> per-spatial-token while preserving the split-RoPE
+        # head axis.
+        video_cross_pe = self._expand_temporal_rope_to_tokens(
+            video_cross_pe,
+            frame_seqlen,
         )
 
         audio_temporal_grid = torch.tensor([[F_a]], device=device, dtype=torch.long)
@@ -977,8 +1153,10 @@ class CausalLTXModel(nn.Module):
             max_pos=[cross_pe_max_pos],
             start_frame=current_audio_start_frame,
             rope_type=self.config.rope_type,
+            num_attention_heads=self.config.audio_heads,
             device=device, dtype=audio_x.dtype,
             is_audio=True,
+            double_precision=self.config.double_precision_rope,
         )
 
         # === Build per-layer args with caches ===
@@ -997,6 +1175,7 @@ class CausalLTXModel(nn.Module):
                 cross_positional_embeddings=video_cross_pe,
                 cross_scale_shift_timestep=video_cross_ss,
                 cross_gate_timestep=video_cross_gate,
+                prompt_timestep=video_prompt_ts,
                 kv_cache_self=layer_caches["video_self"],
                 kv_cache_cross=layer_caches["a2v"],          # video's cross-modal Q reads audio K/V via A2V cache
                 crossattn_cache_text=layer_caches["video_text"],
@@ -1012,6 +1191,7 @@ class CausalLTXModel(nn.Module):
                 cross_positional_embeddings=audio_cross_pe,
                 cross_scale_shift_timestep=audio_cross_ss,
                 cross_gate_timestep=audio_cross_gate,
+                prompt_timestep=audio_prompt_ts,
                 kv_cache_self=layer_caches["audio_self"],
                 kv_cache_cross=layer_caches["v2a"],          # audio's cross-modal Q reads video K/V via V2A cache
                 crossattn_cache_text=layer_caches["audio_text"],

@@ -70,23 +70,25 @@ class TestCausalGenerationConfig:
 
 
 class TestComputeNumBlocks:
-    """Tests for compute_num_blocks with Global Prefix."""
+    """Tests for the 4-3-3 causal block layout."""
 
     def test_16_video_frames(self):
-        """16 frames: 1 Global Prefix + 5 standard = 6 blocks."""
-        assert compute_num_blocks(16, num_frame_per_block=3) == 6
+        """16 frames: one 4-frame block plus four 3-frame blocks."""
+        assert compute_num_blocks(16, num_frame_per_block=3) == 5
 
     def test_1_video_frame(self):
-        """1 frame: only Global Prefix."""
-        assert compute_num_blocks(1, num_frame_per_block=3) == 1
+        """The causal model rejects sequences shorter than its first block."""
+        with pytest.raises(ValueError, match="smaller than"):
+            compute_num_blocks(1, num_frame_per_block=3)
 
     def test_4_video_frames(self):
-        """4 frames: 1 Global Prefix + 1 standard = 2 blocks."""
-        assert compute_num_blocks(4, num_frame_per_block=3) == 2
+        """Four frames exactly fill the first block."""
+        assert compute_num_blocks(4, num_frame_per_block=3) == 1
 
     def test_5_video_frames(self):
-        """5 frames: 1 Global Prefix + 2 standard (1 partial) = 3 blocks."""
-        assert compute_num_blocks(5, num_frame_per_block=3) == 3
+        """Partial trailing blocks are rejected to preserve AV alignment."""
+        with pytest.raises(ValueError, match="not aligned"):
+            compute_num_blocks(5, num_frame_per_block=3)
 
 
 class TestTimeAlignment:

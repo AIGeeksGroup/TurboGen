@@ -17,8 +17,19 @@ checkpoint file, for example:
 
     /path/to/downloaded/omniforcing_ltx2_5s_causal.safetensors.index.json
 
-The script runs the causal KV-cache generator with the released 5-second
-settings:
+For a Step-2 ODE checkpoint, the script defaults to prefix-rerun causal
+inference with Euler updates. This matches the full-sequence causal path used
+during Step-2 training and the ODE trajectory sampler. The KV-cache path is
+kept as an explicit diagnostic option for later self-forcing checkpoints.
+
+The loader accepts both the released sharded ``.safetensors.index.json`` form
+and the training checkpoint ``model.pt`` form.  A ``model.pt`` file is a
+container whose ``generator`` entry is the causal model state dict; it does not
+need to be converted before inference.  For an LTX-2.3-trained model, use the
+same LTX-2.3 FP8 base checkpoint used during training.  Do not combine it with
+the older LTX-2 19B base shown in the historical example below.
+
+The released 5-second settings are:
 
     - 5-second output: 121 frames at 24 FPS
     - resolution: 512 x 768
@@ -89,6 +100,7 @@ from ltx_core.loader.registry import StateDictRegistry
 from ltx_causal.transformer.causal_model import CausalLTXModel, CausalLTXModelConfig
 from ltx_causal.wrapper import CausalLTX2DiffusionWrapper
 from ltx_distillation.inference.causal_pipeline import CausalAVInferencePipeline
+from ltx_distillation.inference.ode_benchmark_pipeline import ODEAutoregressiveBenchmarkPipeline
 from ltx_distillation.models.text_encoder_wrapper import create_text_encoder_wrapper
 from ltx_distillation.models.vae_wrapper import create_vae_wrappers
 
@@ -136,12 +148,27 @@ def load_safetensors_shards(paths: list[Path]) -> dict[str, torch.Tensor]:
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in paths:
-        state_dict.update(load_file(str(path)))
+        shard = load_file(str(path))
+        duplicates = sorted(set(state_dict) & set(shard))
+        if duplicates:
+            raise ValueError(f"Duplicate tensors across checkpoint shards: {duplicates[:20]}")
+        state_dict.update(shard)
     return state_dict
 
 
-def remap_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def remap_state_dict_keys(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    preserve_fp8: bool = False,
+) -> dict[str, torch.Tensor]:
     """Map common LTX checkpoint key layouts to CausalLTX2DiffusionWrapper keys."""
+    from ltx_distillation.ode.ode_regression import LTX2ODERegression
+
+    return LTX2ODERegression._remap_state_dict_keys(state_dict, preserve_fp8=preserve_fp8)
+
+
+def legacy_remap_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Previous standalone remapper kept for reference/fallback debugging."""
     if not state_dict:
         return state_dict
 
@@ -197,6 +224,22 @@ def add_noise(original: torch.Tensor, noise: torch.Tensor, sigma: torch.Tensor) 
         sigma = sigma.reshape(*sigma.shape, *[1] * (original.dim() - 2))
     sigma = sigma.to(dtype=original.dtype)
     return ((1 - sigma) * original + sigma * noise).to(dtype=original.dtype)
+
+
+def print_tensor_stats(name: str, tensor: torch.Tensor) -> None:
+    values = tensor.detach().float()
+    finite = torch.isfinite(values)
+    finite_values = values[finite]
+    if finite_values.numel() == 0:
+        print(f"[stats] {name}: shape={list(tensor.shape)} no finite values", flush=True)
+        return
+    print(
+        f"[stats] {name}: shape={list(tensor.shape)} "
+        f"min={finite_values.min().item():.4f} max={finite_values.max().item():.4f} "
+        f"mean={finite_values.mean().item():.4f} std={finite_values.std().item():.4f} "
+        f"nonfinite={(~finite).sum().item()}",
+        flush=True,
+    )
 
 
 def parse_int_list(text: str) -> list[int]:
@@ -255,12 +298,33 @@ def read_prompts(prompt: list[str] | None, prompt_file: str | None, num_prompts:
 
 
 def build_generator(args: argparse.Namespace, device: torch.device, dtype: torch.dtype):
-    causal_config = CausalLTXModelConfig(
+    from ltx_distillation.ode.ode_regression import LTX2ODERegression
+
+    checkpoint_config = LTX2ODERegression._load_checkpoint_config(args.base_checkpoint)
+    causal_config = CausalLTXModelConfig.from_checkpoint_config(
+        checkpoint_config,
         num_frame_per_block=args.num_frame_per_block,
         num_frame_per_block_first=args.num_frame_per_block_first,
         enable_causal_log_rescale=args.enable_causal_log_rescale,
     )
-    model = CausalLTXModel(causal_config).to(device=device, dtype=dtype)
+    print(
+        "[init] architecture "
+        f"rope={causal_config.rope_type.value} "
+        f"cross_attention_adaln={causal_config.cross_attention_adaln} "
+        f"gated_attention={causal_config.apply_gated_attention}",
+        flush=True,
+    )
+    from ltx_core.model.transformer import (
+        checkpoint_fp8_module_names,
+        convert_to_fp8_training,
+        convert_to_static_fp8,
+    )
+
+    quantized_names = checkpoint_fp8_module_names(args.base_checkpoint)
+    model = CausalLTXModel(causal_config).to(dtype=dtype)
+    if args.fp8_mode == "static":
+        convert_to_static_fp8(model, quantized_names)
+    model = model.to(device=device)
     generator = CausalLTX2DiffusionWrapper(
         model=model,
         video_height=args.height,
@@ -271,23 +335,60 @@ def build_generator(args: argparse.Namespace, device: torch.device, dtype: torch
     )
 
     print(f"[init] Loading base checkpoint: {args.base_checkpoint}", flush=True)
-    base_sd = remap_state_dict_keys(load_checkpoint_state_dict(args.base_checkpoint))
-    for key in [key for key in list(base_sd.keys()) if "audio_sink_tokens" in key]:
-        base_sd.pop(key)
-    missing, unexpected = generator.load_state_dict(base_sd, strict=False)
-    real_missing = [key for key in missing if "mask_builder" not in key and "causal_gate" not in key]
-    if real_missing or unexpected:
-        print(f"[init] base load missing={len(real_missing)} unexpected={len(unexpected)}", flush=True)
+    base_sd = remap_state_dict_keys(
+        load_checkpoint_state_dict(args.base_checkpoint),
+        preserve_fp8=args.fp8_mode == "static",
+    )
+    try:
+        generator.load_state_dict(base_sd, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Base checkpoint is not architecture-compatible with the metadata-built "
+            "LTX-2.3 causal model."
+        ) from exc
+    print("[init] base load missing=0 unexpected=0", flush=True)
 
     print(f"[init] Loading distilled generator: {args.generator_ckpt}", flush=True)
     gen_sd = remap_state_dict_keys(
-        load_checkpoint_state_dict(args.generator_ckpt, prefer_ema=args.use_ema)
+        load_checkpoint_state_dict(args.generator_ckpt, prefer_ema=args.use_ema),
+        preserve_fp8=args.fp8_mode == "static",
     )
-    missing, unexpected = generator.load_state_dict(gen_sd, strict=False)
-    real_missing = [key for key in missing if "mask_builder" not in key]
-    if real_missing or unexpected:
-        print(f"[init] generator load missing={len(real_missing)} unexpected={len(unexpected)}", flush=True)
+    if args.fp8_mode == "static":
+        fp8_weights = {
+            key.removesuffix(".weight")
+            for key, value in gen_sd.items()
+            if key.endswith(".weight") and value.dtype == torch.float8_e4m3fn
+        }
+        weight_scales = {key.removesuffix(".weight_scale") for key in gen_sd if key.endswith(".weight_scale")}
+        input_scales = {key.removesuffix(".input_scale") for key in gen_sd if key.endswith(".input_scale")}
+        if not (
+            len(fp8_weights) == len(quantized_names)
+            and fp8_weights == weight_scales == input_scales
+        ):
+            raise RuntimeError(
+                "--fp8-mode static requires an exported static FP8 Student with "
+                f"{len(quantized_names)} FP8 weights and complete weight/input scales; "
+                f"got weights={len(fp8_weights)}, weight_scales={len(weight_scales)}, "
+                f"input_scales={len(input_scales)}. Use --fp8-mode training together "
+                "with --export-fp8-student for a BF16-master training checkpoint."
+            )
+    try:
+        generator.load_state_dict(gen_sd, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "The student checkpoint was trained with a different causal architecture. "
+            "A legacy 6-way Step-2 checkpoint cannot be loaded as an LTX-2.3 9-way model; "
+            "restart Step-2 from the corrected LTX-2.3 base."
+        ) from exc
+    print(
+        f"[init] generator load tensors={len(gen_sd)} "
+        "missing=0 unexpected=0",
+        flush=True,
+    )
+    if args.fp8_mode == "training":
+        convert_to_fp8_training(model, quantized_names)
 
+    generator.fp8_mode = args.fp8_mode
     generator.requires_grad_(False)
     return generator.eval()
 
@@ -303,57 +404,58 @@ def save_sample(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    video_pixel = video_vae.decode_to_pixel(video_latent)
+    from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+    from ltx_core.model.video_vae import decode_video as vae_decode_video
+    from ltx_pipelines.utils.media_io import encode_video
+
+    latent_for_vae = video_latent.permute(0, 2, 1, 3, 4)
+    print_tensor_stats("video_latent", video_latent)
+    decoded_frames = list(vae_decode_video(latent_for_vae, video_vae.decoder))
+    video = torch.cat(decoded_frames, dim=0)
+    print_tensor_stats("decoded_video_uint8", video)
+
     audio_waveform = None
     if audio_latent is not None:
         try:
-            audio_waveform = audio_vae.decode_to_waveform(audio_latent)
+            audio_waveform = vae_decode_audio(
+                audio_latent.unflatten(-1, (8, 16)).permute(0, 2, 1, 3),
+                audio_vae.decoder,
+                audio_vae.vocoder,
+            )
         except Exception as exc:
             print(f"[warn] audio decode failed for {output_path.name}: {exc}", flush=True)
 
-    video = video_pixel[0]
-    if video.shape[0] == 3:
-        video = video.permute(1, 0, 2, 3)
-    video = video.permute(0, 2, 3, 1)
-    video = (video.clamp(0, 1) * 255).cpu().to(torch.uint8)
-
-    written_with_audio = False
-    if audio_waveform is not None:
-        try:
-            from torchvision.io import write_video
-
-            write_video(
-                str(output_path),
-                video,
-                fps=fps,
-                audio_array=audio_waveform[0].cpu().float(),
-                audio_fps=audio_sample_rate,
-                audio_codec="aac",
-            )
-            written_with_audio = True
-        except Exception as exc:
-            print(f"[warn] write_video with audio failed for {output_path.name}: {exc}", flush=True)
-
-    if not written_with_audio:
-        from torchvision.io import write_video
-
-        write_video(str(output_path), video, fps=fps)
-        if audio_waveform is not None:
-            try:
-                import torchaudio
-
-                torchaudio.save(
-                    str(output_path.with_suffix(".wav")),
-                    audio_waveform[0].cpu().float(),
-                    audio_sample_rate,
-                )
-            except Exception as exc:
-                print(f"[warn] torchaudio.save failed for {output_path.name}: {exc}", flush=True)
+    audio_for_video = audio_waveform.cpu().float() if audio_waveform is not None else None
+    try:
+        encode_video(
+            video=video,
+            fps=fps,
+            audio=audio_for_video,
+            audio_sample_rate=audio_sample_rate if audio_for_video is not None else None,
+            output_path=str(output_path),
+            video_chunks_number=1,
+        )
+    except Exception as exc:
+        if audio_for_video is None:
+            raise
+        print(f"[warn] encode_video with audio failed for {output_path.name}: {exc}", flush=True)
+        encode_video(
+            video=video,
+            fps=fps,
+            audio=None,
+            audio_sample_rate=None,
+            output_path=str(output_path),
+            video_chunks_number=1,
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="OmniForcing causal AV inference")
-    parser.add_argument("--base-checkpoint", required=True, help="LTX-2 base .safetensors checkpoint.")
+    parser.add_argument(
+        "--base-checkpoint",
+        required=True,
+        help="LTX-2 base .safetensors checkpoint used for model config, text encoder, and VAE.",
+    )
     parser.add_argument(
         "--vae-checkpoint",
         default=None,
@@ -364,9 +466,8 @@ def main() -> None:
         "--generator-ckpt",
         required=True,
         help=(
-            "Downloaded OmniForcing causal checkpoint. "
-            "Recommended release checkpoint placeholder: "
-            "<HF_ORG>/<HF_REPO>/omniforcing_ltx2_5s_causal.safetensors.index.json"
+            "OmniForcing causal checkpoint: .pt, .safetensors, or .safetensors.index.json. "
+            "The .pt training checkpoint is read from its generator entry."
         ),
     )
     parser.add_argument("--prompt", action="append", help="Prompt text. Can be passed multiple times.")
@@ -380,7 +481,7 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--fps", type=int, default=24)
-    parser.add_argument("--audio-sample-rate", type=int, default=24000)
+    parser.add_argument("--audio-sample-rate", type=int, default=48000)
 
     parser.add_argument("--denoising-step-list", default="1000,909,725,421,0")
     parser.add_argument("--num-inference-steps", type=int, default=40)
@@ -390,10 +491,35 @@ def main() -> None:
     parser.add_argument("--num-train-timestep", type=int, default=1000)
     parser.add_argument("--disable-causal-mask", action="store_true")
     parser.add_argument("--enable-causal-log-rescale", action="store_true")
+    parser.add_argument(
+        "--pipeline",
+        choices=("ode-prefix", "kv-cache"),
+        default="ode-prefix",
+        help="Step-2 uses ode-prefix; kv-cache is retained for controlled diagnostics.",
+    )
+    parser.add_argument(
+        "--transition-mode",
+        choices=("euler", "renoise"),
+        default="euler",
+        help="ODE checkpoints should use Euler; renoise reproduces the legacy sampler.",
+    )
+    parser.add_argument("--use-bidirectional-bootstrap", action="store_true")
+    parser.add_argument("--log-step-stats", action="store_true")
 
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--use-ema", action="store_true")
+    parser.add_argument(
+        "--fp8-mode",
+        choices=("static", "training"),
+        default="static",
+        help="Use an exported static FP8 checkpoint, or a training checkpoint for calibration/export.",
+    )
+    parser.add_argument(
+        "--export-fp8-student",
+        default=None,
+        help="With --fp8-mode training, calibrate on the requested prompts and export a static FP8 student.",
+    )
     parser.add_argument("--save-latents", action="store_true")
     args = parser.parse_args()
 
@@ -424,6 +550,12 @@ def main() -> None:
         dtype=dtype,
         registry=registry,
     )
+    checkpoint_audio_sample_rate = int(audio_vae.vocoder.output_sample_rate)
+    if args.audio_sample_rate != checkpoint_audio_sample_rate:
+        raise RuntimeError(
+            "--audio-sample-rate does not match the checkpoint vocoder: "
+            f"{args.audio_sample_rate} != {checkpoint_audio_sample_rate}"
+        )
 
     sigmas = denoising_sigmas(
         denoising_step_list=parse_int_list(args.denoising_step_list),
@@ -432,16 +564,40 @@ def main() -> None:
     )
     print(f"[init] denoising_sigmas={sigmas.detach().cpu().tolist()}", flush=True)
 
-    pipeline = CausalAVInferencePipeline(
-        generator=generator,
-        add_noise_fn=add_noise,
-        denoising_sigmas=sigmas,
-        num_frame_per_block=args.num_frame_per_block,
-        num_frame_per_block_first=args.num_frame_per_block_first,
-        context_noise=args.context_noise,
-        num_train_timestep=args.num_train_timestep,
-        clear_cuda_cache_per_round=True,
+    print(
+        f"[init] pipeline={args.pipeline} transition_mode={args.transition_mode} "
+        f"bidirectional_bootstrap={args.use_bidirectional_bootstrap}",
+        flush=True,
     )
+    if args.pipeline == "ode-prefix":
+        pipeline = ODEAutoregressiveBenchmarkPipeline(
+            generator=generator,
+            add_noise_fn=add_noise,
+            denoising_sigmas=sigmas,
+            num_frame_per_block=args.num_frame_per_block,
+            num_frame_per_block_first=args.num_frame_per_block_first,
+            clear_cuda_cache_per_round=True,
+            transition_mode=args.transition_mode,
+            use_bidirectional_bootstrap=args.use_bidirectional_bootstrap,
+            log_step_stats=args.log_step_stats,
+        )
+    else:
+        if args.transition_mode != "renoise":
+            print(
+                "[warn] kv-cache pipeline currently uses its legacy renoise transition; "
+                "--transition-mode is ignored.",
+                flush=True,
+            )
+        pipeline = CausalAVInferencePipeline(
+            generator=generator,
+            add_noise_fn=add_noise,
+            denoising_sigmas=sigmas,
+            num_frame_per_block=args.num_frame_per_block,
+            num_frame_per_block_first=args.num_frame_per_block_first,
+            context_noise=args.context_noise,
+            num_train_timestep=args.num_train_timestep,
+            clear_cuda_cache_per_round=True,
+        )
 
     video_shape, audio_shape = compute_latent_shapes(
         num_frames=args.num_frames,
@@ -462,8 +618,19 @@ def main() -> None:
         "video_shape": video_shape,
         "audio_shape": audio_shape,
         "denoising_sigmas": sigmas.detach().cpu().tolist(),
+        "pipeline": args.pipeline,
+        "transition_mode": args.transition_mode,
+        "use_bidirectional_bootstrap": args.use_bidirectional_bootstrap,
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    calibrator = None
+    if args.export_fp8_student:
+        if args.fp8_mode != "training":
+            raise ValueError("--export-fp8-student requires --fp8-mode training")
+        from ltx_core.model.transformer import FP8InputScaleCalibrator
+        calibrator = FP8InputScaleCalibrator(generator)
+        calibrator.__enter__()
 
     for local_idx, prompt in enumerate(prompts):
         prompt_idx = args.start_index + local_idx
@@ -509,6 +676,37 @@ def main() -> None:
         del video_latent, audio_latent, conditional_dict
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+    if calibrator is not None:
+        calibrator.__exit__(None, None, None)
+        from ltx_core.model.transformer import fp8_inference_state_dict
+        from safetensors.torch import save_file
+        fp8_state = fp8_inference_state_dict(generator, calibrator.input_scales())
+        quantized_layers = {
+            key.removesuffix(".weight"): {"format": "float8_e4m3fn"}
+            for key, value in fp8_state.items()
+            if key.endswith(".weight") and value.dtype == torch.float8_e4m3fn
+        }
+        if len(quantized_layers) != 1496:
+            raise RuntimeError(
+                f"Refusing incomplete FP8 Student export: quantized_layers={len(quantized_layers)}, expected=1496"
+            )
+        from ltx_distillation.ode.ode_regression import LTX2ODERegression
+        export_config = LTX2ODERegression._load_checkpoint_config(args.base_checkpoint)
+        from safetensors import safe_open
+        with safe_open(args.base_checkpoint, framework="pt", device="cpu") as handle:
+            base_metadata = handle.metadata() or {}
+        export_metadata = {
+            "config": json.dumps(export_config),
+            "model_version": base_metadata.get("model_version", "2.3.rc1"),
+            "checkpoint_kind": "omniforcing_causal_student_static_fp8",
+            "student_format_version": "1",
+            "_quantization_metadata": json.dumps({"format_version": "1.0", "layers": quantized_layers}),
+        }
+        export_path = Path(args.export_fp8_student)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        save_file(fp8_state, str(export_path), metadata=export_metadata)
+        print(f"[export] static FP8 student saved to {args.export_fp8_student}", flush=True)
 
     print(f"[done] saved to {output_dir}", flush=True)
 

@@ -20,12 +20,17 @@ The LMDB stores:
 import os
 import glob
 import argparse
+import json
 from typing import Dict, Any, Set
 from tqdm import tqdm
 
 import numpy as np
 import torch
 import lmdb
+
+
+ODE_FORMAT_VERSION = 4
+ODE_PRODUCER = "omniforcing-ltx23-full-architecture-v2"
 
 
 def store_arrays_to_lmdb(
@@ -112,6 +117,7 @@ def retrieve_row_from_lmdb(
 def process_trajectory_file(
     file_path: str,
     seen_prompts: Set[str],
+    manifest: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Process a single trajectory .pt file.
@@ -125,7 +131,21 @@ def process_trajectory_file(
     """
     data = torch.load(file_path, map_location='cpu', weights_only=False)
 
+    if manifest is not None:
+        if data.get("format_version") != manifest.get("format_version"):
+            raise ValueError(f"Trajectory format mismatch in {file_path}")
+        if data.get("producer") != manifest.get("producer"):
+            raise ValueError(f"Trajectory producer mismatch in {file_path}")
+        if os.path.abspath(data.get("teacher_checkpoint", "")) != os.path.abspath(
+            manifest.get("teacher_checkpoint", "")
+        ):
+            raise ValueError(f"Teacher checkpoint provenance mismatch in {file_path}")
+        if data.get("generation_config") != manifest.get("generation_config"):
+            raise ValueError(f"Generation config provenance mismatch in {file_path}")
+
     prompt = data.get('prompt', '')
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"Missing prompt in {file_path}")
 
     # Deduplicate by prompt
     if prompt in seen_prompts:
@@ -140,6 +160,25 @@ def process_trajectory_file(
 
     if video_trajectory is None:
         raise ValueError(f"Missing video_trajectory in {file_path}")
+    if not torch.is_tensor(video_trajectory) or video_trajectory.ndim != 6:
+        raise ValueError(
+            f"Invalid video_trajectory shape in {file_path}: "
+            f"{getattr(video_trajectory, 'shape', None)}"
+        )
+    if video_trajectory.shape[0] != 1:
+        raise ValueError(f"Expected one trajectory per file in {file_path}")
+    if audio_trajectory is not None:
+        if not torch.is_tensor(audio_trajectory) or audio_trajectory.ndim != 4:
+            raise ValueError(
+                f"Invalid audio_trajectory shape in {file_path}: "
+                f"{getattr(audio_trajectory, 'shape', None)}"
+            )
+        if audio_trajectory.shape[:2] != video_trajectory.shape[:2]:
+            raise ValueError(f"Audio/video trajectory length mismatch in {file_path}")
+    if sigmas is None or not torch.is_tensor(sigmas) or sigmas.ndim != 1:
+        raise ValueError(f"Missing or invalid sigma trajectory in {file_path}")
+    if sigmas.shape[0] != video_trajectory.shape[1]:
+        raise ValueError(f"Sigma/video trajectory length mismatch in {file_path}")
 
     # Convert to numpy float16 for storage efficiency
     video_latents = video_trajectory.half().numpy()
@@ -158,6 +197,7 @@ def create_lmdb_from_trajectories(
     data_path: str,
     lmdb_path: str,
     map_size: int = 5_000_000_000_000,  # 5TB default
+    require_manifest: bool = False,
 ) -> None:
     """
     Create LMDB database from trajectory .pt files.
@@ -174,6 +214,41 @@ def create_lmdb_from_trajectories(
     if len(all_files) == 0:
         raise ValueError(f"No .pt files found in {data_path}")
 
+    if os.path.exists(lmdb_path):
+        raise FileExistsError(f"Refusing to overwrite existing LMDB: {lmdb_path}")
+
+    manifest_path = os.path.join(data_path, "manifest.json")
+    manifest = None
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("format_version") != ODE_FORMAT_VERSION:
+            raise ValueError(f"Unsupported ODE manifest version: {manifest_path}")
+        if manifest.get("producer") != ODE_PRODUCER:
+            raise ValueError(f"Unsupported ODE manifest producer: {manifest_path}")
+    elif require_manifest:
+        raise ValueError(f"Required ODE manifest not found: {manifest_path}")
+
+    if require_manifest:
+        validation_seen: Set[str] = set()
+        expected_shapes = None
+        for file_path in tqdm(all_files, desc="Validating trajectory provenance"):
+            data_dict = process_trajectory_file(file_path, validation_seen, manifest)
+            if data_dict is None:
+                raise ValueError(f"Duplicate prompt found while validating {file_path}")
+            shape_signature = (
+                tuple(data_dict['video_latents'].shape),
+                tuple(data_dict['audio_latents'].shape) if data_dict['audio_latents'] is not None else None,
+                tuple(data_dict['sigmas'].shape),
+            )
+            if expected_shapes is None:
+                expected_shapes = shape_signature
+            elif shape_signature != expected_shapes:
+                raise ValueError(
+                    f"Trajectory shape mismatch in {file_path}: "
+                    f"{shape_signature} != {expected_shapes}"
+                )
+
     # Create LMDB
     os.makedirs(os.path.dirname(lmdb_path) if os.path.dirname(lmdb_path) else '.', exist_ok=True)
     env = lmdb.open(lmdb_path, map_size=map_size)
@@ -182,11 +257,15 @@ def create_lmdb_from_trajectories(
     seen_prompts: Set[str] = set()
     last_video_shape = None
     last_audio_shape = None
+    last_sigmas_shape = None
 
     for file_path in tqdm(all_files, desc="Processing trajectory files"):
         try:
-            data_dict = process_trajectory_file(file_path, seen_prompts)
+            data_dict = process_trajectory_file(file_path, seen_prompts, manifest)
         except Exception as e:
+            if require_manifest:
+                env.close()
+                raise RuntimeError(f"Failed to convert required trajectory {file_path}") from e
             print(f"Error processing {file_path}: {e}")
             continue
 
@@ -226,6 +305,10 @@ def create_lmdb_from_trajectories(
         last_audio_shape = audio_latents.shape if audio_latents is not None else None
         last_sigmas_shape = sigmas.shape if sigmas is not None else None
 
+    if counter == 0:
+        env.close()
+        raise RuntimeError(f"No valid trajectories were written from {data_path}")
+
     # Save shapes to LMDB
     if last_video_shape is not None:
         with env.begin(write=True) as txn:
@@ -250,6 +333,11 @@ def create_lmdb_from_trajectories(
 
             # Prompts shape
             txn.put("prompts_shape".encode(), f"{counter}".encode())
+            if manifest is not None:
+                txn.put(
+                    "manifest_json".encode(),
+                    json.dumps(manifest, sort_keys=True).encode("utf-8"),
+                )
 
     env.close()
     print(f"Created LMDB at {lmdb_path} with {counter} entries")
@@ -278,6 +366,11 @@ def main():
         default=5_000_000_000_000,
         help="Maximum LMDB size in bytes (default: 5TB)"
     )
+    parser.add_argument(
+        "--require_manifest",
+        action="store_true",
+        help="Require versioned LTX-2.3 ODE provenance metadata",
+    )
 
     args = parser.parse_args()
 
@@ -285,6 +378,7 @@ def main():
         data_path=args.data_path,
         lmdb_path=args.lmdb_path,
         map_size=args.map_size,
+        require_manifest=args.require_manifest,
     )
 
 

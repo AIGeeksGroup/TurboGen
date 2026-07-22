@@ -13,6 +13,7 @@ dependencies = [
     "safetensors",
     "accelerate",
     "scipy>=1.14",
+    "torchao==0.11.0",
 ]
 
 [project.optional-dependencies]

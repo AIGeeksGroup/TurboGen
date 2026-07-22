@@ -8,9 +8,14 @@
 # Model Paths
 # =============================================================================
 checkpoint_path: ../../../checkpoints/LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors
+training_stage: stage2_causal_ode
 causal_model_checkpoint: null
+resume_checkpoint: null
 bidirectional_model_checkpoint: null
 text_encoder_checkpoint: ../../../checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
+require_ltx23_architecture: true
+teacher_fp8_mode: static
+trainable_fp8_mode: training
 
 # =============================================================================
 # Task Configuration
@@ -52,6 +57,7 @@ num_train_timestep: 1000
 # =============================================================================
 mixed_precision: true
 gradient_checkpointing: true
+expected_world_size: 8
 batch_size: 1
 lr: 2.0e-04
 beta1: 0.9
@@ -65,7 +71,8 @@ max_steps: 1000000
 # =============================================================================
 # Data Configuration
 # =============================================================================
-data_path: ./ode_lmdb
+data_path: ./ode_lmdb_ltx23_v4
+require_ode_manifest: true
 max_pair: 1000000
 load_audio: true
 num_workers: 8
@@ -83,7 +90,7 @@ min_num_params: 100000000
 # =============================================================================
 output_path: ./outputs/stage2_causal_ode
 log_iters: 10
-visualize_iters: 100
+visualize_iters: 500
 save_iters: 500
 benchmark_enabled: true
 benchmark_iters: 500
@@ -91,14 +98,25 @@ benchmark_prompt_file: ./prompts/benchmark_8.txt
 benchmark_num_prompts: 8
 benchmark_seed: 12345
 benchmark_video_fps: 24
-benchmark_audio_sample_rate: 24000
+benchmark_audio_sample_rate: 48000
 benchmark_num_frame_per_block: 3
 benchmark_clear_cuda_cache_per_round: true
 
-wandb_project: omniforcing-debug
-wandb_entity: 547634227-peking-university
+wandb_project: OmniForcing
+wandb_entity: OmniForcing1
 wandb_name: stage2_causal_ode
-wandb_api_key: "your-wandb-api-key"
+wandb_api_key: ""
+wandb_api_key_file: ../../../.wandb_key
+wandb_video_required: true
+
+hf_upload_repo_id: aaachier/OmniForcing-backup
+hf_upload_token_file: ../../../.hf_token
+hf_upload_repo_type: model
+hf_upload_path_prefix: step2_ltx23
+hf_upload_create_repo: true
+hf_upload_blocking: true
+hf_upload_required: true
+hf_upload_benchmark: false
 
 seed: 42
 no_save: false

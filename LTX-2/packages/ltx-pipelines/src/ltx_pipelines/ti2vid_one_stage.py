@@ -15,7 +15,6 @@ from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.args import default_1_stage_arg_parser
-from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
@@ -153,8 +152,10 @@ class TI2VidOneStagePipeline:
         cleanup_memory()
 
         decoded_video = vae_decode_video(video_state.latent, self.model_ledger.video_decoder(), generator=generator)
+        vocoder = self.model_ledger.vocoder()
+        self.audio_sample_rate = int(vocoder.output_sample_rate)
         decoded_audio = vae_decode_audio(
-            audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
+            audio_state.latent, self.model_ledger.audio_decoder(), vocoder
         )
 
         return decoded_video, decoded_audio
@@ -203,7 +204,7 @@ def main() -> None:
         video=video,
         fps=args.frame_rate,
         audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE,
+        audio_sample_rate=pipeline.audio_sample_rate,
         output_path=args.output_path,
         video_chunks_number=1,
     )

@@ -84,6 +84,7 @@ class CausalLTXAttention(nn.Module):
         dim_head: int = 64,
         norm_eps: float = 1e-6,
         rope_type: CausalRopeType = CausalRopeType.INTERLEAVED,
+        apply_gated_attention: bool = False,
         # Kept in signature for backward-compatible construction but unused
         local_attn_size: int = -1,
         sink_size: int = 1,
@@ -105,6 +106,12 @@ class CausalLTXAttention(nn.Module):
         # Q/K Normalization
         self.q_norm = RMSNorm(self.inner_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.inner_dim, eps=norm_eps)
+
+        # LTX-2.3 optionally applies a learned per-head gate after attention.
+        # Keep the module name identical to the official checkpoint.
+        self.to_gate_logits = (
+            nn.Linear(query_dim, heads, bias=True) if apply_gated_attention else None
+        )
 
         # Output projection
         self.to_out = nn.Sequential(
@@ -180,7 +187,7 @@ class CausalLTXAttention(nn.Module):
             attn_mask = mask if mask is not None else None
             out = standard_attention_forward(q, k_full, v_full, attn_mask)
             out = out.reshape(B, -1, self.inner_dim)
-            return self.to_out(out)
+            return self.to_out(self._apply_attention_gate(x, out))
 
         # ============================================================
         # KV-cache causal path (self-attn or cross-modal attn).
@@ -230,7 +237,7 @@ class CausalLTXAttention(nn.Module):
 
             out = standard_attention_forward(q, k_full, v_full)
             out = out.reshape(B, -1, self.inner_dim)
-            return self.to_out(out)
+            return self.to_out(self._apply_attention_gate(x, out))
 
         # ============================================================
         # Original full-sequence training paths (bidirectional, or
@@ -271,20 +278,44 @@ class CausalLTXAttention(nn.Module):
 
         # Reshape and project output
         out = out.reshape(B, -1, self.inner_dim)
-        return self.to_out(out)
+        return self.to_out(self._apply_attention_gate(x, out))
+
+    def _apply_attention_gate(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Apply LTX-2.3's learned per-head attention gate, when enabled."""
+        if self.to_gate_logits is None:
+            return out
+        batch_size, token_count, _ = out.shape
+        gate_logits = self.to_gate_logits(x)
+        gates = 2.0 * torch.sigmoid(gate_logits)
+        out = out.reshape(batch_size, token_count, self.heads, self.dim_head)
+        return (out * gates.unsqueeze(-1)).reshape(batch_size, token_count, self.inner_dim)
 
     def _apply_rope(
         self,
         x: torch.Tensor,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Apply RoPE to input tensor. Only INTERLEAVED mode is supported."""
-        if self.rope_type != CausalRopeType.INTERLEAVED:
-            raise ValueError(
-                f"Only CausalRopeType.INTERLEAVED is supported, got {self.rope_type}. "
-                f"SPLIT mode is not implemented correctly for causal generation."
-            )
+        """Apply either legacy interleaved or LTX-2.3 split RoPE."""
         cos_freqs, sin_freqs = freqs_cis
+        if self.rope_type == CausalRopeType.SPLIT:
+            if cos_freqs.ndim != 4 or sin_freqs.shape != cos_freqs.shape:
+                raise ValueError(
+                    "Split RoPE expects cos/sin tensors shaped "
+                    "[batch, heads, tokens, head_dim // 2]."
+                )
+            x_heads = x.unflatten(-1, (self.heads, self.dim_head)).transpose(1, 2)
+            x_pairs = x_heads.unflatten(-1, (2, self.dim_head // 2))
+            first, second = x_pairs.unbind(dim=-2)
+            rotated = torch.stack(
+                (
+                    first * cos_freqs - second * sin_freqs,
+                    second * cos_freqs + first * sin_freqs,
+                ),
+                dim=-2,
+            )
+            return rotated.flatten(-2).transpose(1, 2).flatten(-2)
+        if self.rope_type != CausalRopeType.INTERLEAVED:
+            raise ValueError(f"Unsupported causal RoPE type: {self.rope_type}")
         return apply_interleaved_rotary_emb(x, cos_freqs, sin_freqs)
 
 

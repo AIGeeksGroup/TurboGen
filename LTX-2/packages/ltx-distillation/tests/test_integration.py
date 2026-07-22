@@ -123,11 +123,11 @@ class TestODEPipelineIntegration:
 
             txn.put(
                 "video_latents_shape".encode(),
-                f"{num_samples} " + " ".join(map(str, video_shape)).encode()
+                (f"{num_samples} " + " ".join(map(str, video_shape))).encode()
             )
             txn.put(
                 "audio_latents_shape".encode(),
-                f"{num_samples} " + " ".join(map(str, audio_shape)).encode()
+                (f"{num_samples} " + " ".join(map(str, audio_shape))).encode()
             )
             txn.put("prompts_shape".encode(), str(num_samples).encode())
 

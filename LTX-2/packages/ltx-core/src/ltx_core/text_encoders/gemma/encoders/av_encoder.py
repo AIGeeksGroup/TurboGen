@@ -53,12 +53,15 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         self.audio_embeddings_connector = audio_embeddings_connector.to(dtype=dtype)
 
     def _run_connectors(
-        self, encoded_input: torch.Tensor, attention_mask: torch.Tensor
+        self,
+        video_input: torch.Tensor,
+        audio_input: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        connector_attention_mask = self._convert_to_additive_mask(attention_mask, encoded_input.dtype)
+        connector_attention_mask = self._convert_to_additive_mask(attention_mask, video_input.dtype)
 
         encoded, encoded_connector_attention_mask = self.embeddings_connector(
-            encoded_input,
+            video_input,
             connector_attention_mask,
         )
 
@@ -67,13 +70,18 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         attention_mask = attention_mask.reshape([encoded.shape[0], encoded.shape[1], 1])
         encoded = encoded * attention_mask
 
-        encoded_for_audio, _ = self.audio_embeddings_connector(encoded_input, connector_attention_mask)
+        encoded_for_audio, _ = self.audio_embeddings_connector(audio_input, connector_attention_mask)
 
         return encoded, encoded_for_audio, attention_mask.squeeze(-1)
 
     def forward(self, text: str, padding_side: str = "left") -> AVGemmaEncoderOutput:
         encoded_inputs, attention_mask = self._preprocess_text(text, padding_side)
-        video_encoding, audio_encoding, attention_mask = self._run_connectors(encoded_inputs, attention_mask)
+        video_input, audio_input = encoded_inputs
+        video_encoding, audio_encoding, attention_mask = self._run_connectors(
+            video_input,
+            audio_input,
+            attention_mask,
+        )
         return AVGemmaEncoderOutput(video_encoding, audio_encoding, attention_mask)
 
 

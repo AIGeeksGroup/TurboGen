@@ -47,7 +47,7 @@ DEFAULT_AUDIO_GUIDER_PARAMS = MultiModalGuiderParams(
     skip_step=0,
     stg_blocks=[29],
 )
-AUDIO_SAMPLE_RATE = 24000
+AUDIO_SAMPLE_RATE = 48000
 
 
 # =============================================================================

@@ -86,6 +86,40 @@ class TestODERegressionConfig:
         assert config.denoising_step_list[-1] == 0
 
 
+class TestCheckpointLoading:
+    """Tests for checkpoint format and FP8 scale handling."""
+
+    def test_folds_prequantized_fp8_weights(self):
+        if not hasattr(torch, "float8_e4m3fn"):
+            pytest.skip("This PyTorch build has no FP8 dtype")
+
+        quantized = torch.tensor([[1.0, -2.0]], dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.tensor(0.25, dtype=torch.float32)
+        state_dict = {
+            "model.diffusion_model.transformer_blocks.0.to_q.weight": quantized,
+            "model.diffusion_model.transformer_blocks.0.to_q.weight_scale": scale,
+            "model.diffusion_model.transformer_blocks.0.to_q.input_scale": scale,
+        }
+
+        folded = LTX2ODERegression._fold_prequantized_fp8_scales(state_dict)
+
+        assert "model.diffusion_model.transformer_blocks.0.to_q.weight_scale" not in folded
+        assert "model.diffusion_model.transformer_blocks.0.to_q.input_scale" not in folded
+        assert folded["model.diffusion_model.transformer_blocks.0.to_q.weight"].dtype == torch.bfloat16
+        assert torch.allclose(
+            folded["model.diffusion_model.transformer_blocks.0.to_q.weight"].float(),
+            quantized.float() * scale,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+    def test_leaves_bf16_state_dict_unchanged(self):
+        weight = torch.tensor([[1.0]], dtype=torch.bfloat16)
+        state_dict = {"model.weight": weight}
+
+        assert LTX2ODERegression._fold_prequantized_fp8_scales(state_dict) is state_dict
+
+
 class TestTimestepProcessing:
     """Tests for timestep processing logic."""
 
@@ -168,28 +202,45 @@ class TestInputPreparation:
         assert torch.allclose(noisy_input[1], trajectory[1, 1])
 
     def test_audio_alignment_with_video(self):
-        """Test aligning audio frame indices with video frames."""
-        video_frames = 8
-        audio_frames = 64  # 8 audio per video
-        num_frame_per_block = 4
+        """Map 4+3+3+3+3 video blocks to 26+25+25+25+25 audio blocks."""
+        regression = object.__new__(LTX2ODERegression)
+        torch.nn.Module.__init__(regression)
+        regression.config = SimpleNamespace(
+            num_frame_per_block=3,
+            num_frame_per_block_first=4,
+        )
+        video_indices = torch.tensor(
+            [[0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]]
+        )
 
-        # Video timestep indices (uniform within blocks)
-        video_indices = torch.tensor([[0, 0, 0, 0, 2, 2, 2, 2]])
+        audio_indices = regression._expand_video_blocks_to_audio(
+            video_indices,
+            126,
+            value_name="trajectory index",
+        )
 
-        # Expand to audio
-        audio_per_video = audio_frames / video_frames  # 8
+        assert audio_indices.shape == (1, 126)
+        assert torch.all(audio_indices[:, :26] == 0)
+        assert torch.all(audio_indices[:, 26:51] == 1)
+        assert torch.all(audio_indices[:, 51:76] == 2)
+        assert torch.all(audio_indices[:, 76:101] == 3)
+        assert torch.all(audio_indices[:, 101:] == 4)
 
-        audio_indices = torch.zeros(1, audio_frames, dtype=torch.long)
-        for i in range(video_frames):
-            start = int(i * audio_per_video)
-            end = int((i + 1) * audio_per_video) if i < video_frames - 1 else audio_frames
-            audio_indices[:, start:end] = video_indices[:, i:i+1]
+    def test_audio_alignment_rejects_ratio_only_shape(self):
+        regression = object.__new__(LTX2ODERegression)
+        torch.nn.Module.__init__(regression)
+        regression.config = SimpleNamespace(
+            num_frame_per_block=3,
+            num_frame_per_block_first=4,
+        )
+        video_indices = torch.zeros((1, 16), dtype=torch.long)
 
-        # Check alignment
-        # First 32 audio frames (4 video frames * 8) should have index 0
-        assert torch.all(audio_indices[:, :32] == 0)
-        # Last 32 audio frames should have index 2
-        assert torch.all(audio_indices[:, 32:] == 2)
+        with pytest.raises(ValueError, match="got F_a=125, expected 126"):
+            regression._expand_video_blocks_to_audio(
+                video_indices,
+                125,
+                value_name="trajectory index",
+            )
 
 
 class TestLossComputation:

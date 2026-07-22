@@ -31,6 +31,14 @@ class EMA_FSDP:
     def state_dict(self):
         return self.shadow
 
+    @classmethod
+    def from_state_dict(cls, state_dict, decay: float = 0.99):
+        """Restore EMA without first gathering another full FSDP model copy."""
+        instance = cls.__new__(cls)
+        instance.decay = decay
+        instance.shadow = dict(state_dict)
+        return instance
+
     def load_state_dict(self, sd):
         self.shadow = {k: v.clone() for k, v in sd.items()}
 
@@ -38,4 +46,4 @@ class EMA_FSDP:
         with FSDP.summon_full_params(fsdp_module, writeback=True):
             for n, p in fsdp_module.module.named_parameters():
                 if n in self.shadow:
-                    p.data.copy_(self.shadow[n].to(p.dtype, device=p.device))
+                    p.data.copy_(self.shadow[n].to(device=p.device, dtype=p.dtype))

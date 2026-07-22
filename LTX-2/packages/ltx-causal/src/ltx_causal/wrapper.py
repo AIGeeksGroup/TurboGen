@@ -21,11 +21,13 @@ from ltx_causal.config import (
     CausalMaskConfig,
 )
 from ltx_causal.transformer.causal_model import CausalLTXModel, CausalLTXModelConfig
+from ltx_causal.checkpoint import load_checkpoint_config
 from ltx_causal.attention.mask_builder import (
     build_all_causal_masks,
     compute_aligned_audio_frames,
 )
 from ltx_core.model.transformer.model import LTXModel, LTXModelType, X0Model
+from ltx_core.model.transformer.rope import LTXRopeType
 
 
 class CausalLTX2DiffusionWrapper(nn.Module):
@@ -127,7 +129,10 @@ class CausalLTX2DiffusionWrapper(nn.Module):
 
     def set_module_grad(self, module_grad: Dict[str, bool]) -> None:
         """Set gradient requirements for model components."""
-        if module_grad.get("model", True):
+        train_model = module_grad.get("model", True)
+        if train_model and getattr(self, "fp8_mode", None) == "static":
+            raise RuntimeError("A static FP8 Teacher is frozen and cannot be made trainable")
+        if train_model:
             self.model.requires_grad_(True)
         else:
             self.model.requires_grad_(False)
@@ -162,7 +167,36 @@ class CausalLTX2DiffusionWrapper(nn.Module):
             audio_cross_attention_dim=model_config.audio_cross_attention_dim,
             audio_positional_embedding_max_pos=list(model_config.audio_pe_max_pos),
             av_ca_timestep_scale_multiplier=model_config.av_ca_timestep_scale_multiplier,
-        ).to(device=next(self.model.parameters()).device, dtype=next(self.model.parameters()).dtype)
+            use_middle_indices_grid=model_config.use_middle_indices_grid,
+            double_precision_rope=model_config.double_precision_rope,
+            rope_type=LTXRopeType(model_config.rope_type.value),
+            use_caption_projection=model_config.use_caption_projection,
+            apply_gated_attention=model_config.apply_gated_attention,
+            cross_attention_adaln=model_config.cross_attention_adaln,
+        )
+
+        from ltx_core.model.transformer import StaticFP8Linear, convert_to_fp8_training, convert_to_static_fp8
+
+        static_names = {
+            name for name, module in self.model.named_modules() if isinstance(module, StaticFP8Linear)
+        }
+        try:
+            from torchao.float8.float8_linear import Float8Linear
+        except ImportError:
+            Float8Linear = ()
+        training_names = {
+            name for name, module in self.model.named_modules() if isinstance(module, Float8Linear)
+        }
+        if static_names and training_names:
+            raise RuntimeError("Causal model mixes static and training FP8 Linear layers")
+        if static_names:
+            convert_to_static_fp8(velocity_model, static_names)
+        elif training_names:
+            convert_to_fp8_training(velocity_model, training_names)
+        velocity_model = velocity_model.to(
+            device=next(self.model.parameters()).device,
+            dtype=next(self.model.parameters()).dtype,
+        )
 
         state_dict = {
             key: value
@@ -183,6 +217,8 @@ class CausalLTX2DiffusionWrapper(nn.Module):
             video_width=self.video_width,
             vae_spatial_compression=self.vae_spatial_compression,
         )
+        delegate.fp8_mode = getattr(self, "fp8_mode", None)
+        delegate.requires_grad_(False)
         delegate.eval()
         return delegate
 
@@ -300,6 +336,17 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         else:
             return sigma
 
+    @staticmethod
+    def _scalar_sigma(sigma: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Reduce per-frame sigma values to LTX-2.3's per-sample sigma."""
+        if sigma.ndim == 1:
+            if sigma.shape[0] != batch_size:
+                raise ValueError(
+                    f"Sigma batch mismatch: expected {batch_size}, got {sigma.shape[0]}"
+                )
+            return sigma
+        return sigma.reshape(batch_size, -1).amax(dim=1)
+
     def forward(
         self,
         noisy_image_or_video: torch.Tensor,
@@ -393,6 +440,9 @@ class CausalLTX2DiffusionWrapper(nn.Module):
             )
 
         # Process timestep
+        video_sigma = self._scalar_sigma(timestep, B)
+        audio_sigma_source = audio_timestep if audio_timestep is not None else timestep
+        audio_sigma = self._scalar_sigma(audio_sigma_source, B)
         if use_causal_timestep and timestep.ndim > 1:
             timestep = self._process_timestep_causal(timestep)
 
@@ -428,6 +478,8 @@ class CausalLTX2DiffusionWrapper(nn.Module):
             video_context_mask=video_context_mask,
             audio_context_mask=audio_context_mask,
             audio_timesteps=audio_timestep,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
             masks=masks,
         )
 
@@ -444,7 +496,7 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         ).to(noisy_image_or_video.dtype)
 
         # Audio: x0 = noisy_audio - velocity * sigma
-        audio_sigma_raw = audio_timestep if audio_timestep is not None else timestep
+        audio_sigma_raw = audio_timestep if audio_timestep is not None else audio_sigma
         audio_sigma = self._reshape_sigma_for_broadcast(audio_sigma_raw, noisy_audio)
         audio_x0 = (
             noisy_audio.to(compute_dtype)
@@ -508,6 +560,11 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         if audio_context_mask is None and shared_mask is not None:
             audio_context_mask = shared_mask
 
+        batch_size = noisy_image_or_video.shape[0]
+        video_sigma = self._scalar_sigma(timestep, batch_size)
+        audio_sigma_source = audio_timestep if audio_timestep is not None else timestep
+        audio_sigma = self._scalar_sigma(audio_sigma_source, batch_size)
+
         # Call through self.model(...) (not .forward_with_cache) so that if
         # self.model is FSDP-wrapped, the FSDP pre/post-forward hooks fire
         # and unshard parameters. CausalLTXModel.forward() dispatches to
@@ -521,6 +578,8 @@ class CausalLTX2DiffusionWrapper(nn.Module):
             audio_context=audio_context,
             video_context_mask=video_context_mask,
             audio_context_mask=audio_context_mask,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
             kv_caches=kv_caches,
             current_video_start_frame=current_video_start_frame,
             current_audio_start_frame=current_audio_start_frame,
@@ -536,7 +595,7 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         if noisy_audio is None:
             return video_x0, None
 
-        audio_sigma_raw = audio_timestep if audio_timestep is not None else timestep
+        audio_sigma_raw = audio_timestep if audio_timestep is not None else audio_sigma
         audio_sigma = self._reshape_sigma_for_broadcast(audio_sigma_raw, noisy_audio)
         audio_x0 = (
             noisy_audio.to(compute_dtype)
@@ -558,7 +617,13 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ) -> "CausalLTX2DiffusionWrapper":
         """Load wrapper from pretrained checkpoint."""
-        config = CausalLTXModelConfig(
+        checkpoint_config = load_checkpoint_config(checkpoint_path)
+        if not checkpoint_config:
+            raise ValueError(
+                "Causal wrapper construction requires safetensors architecture metadata"
+            )
+        config = CausalLTXModelConfig.from_checkpoint_config(
+            checkpoint_config,
             num_frame_per_block=num_frame_per_block,
             num_frame_per_block_first=num_frame_per_block_first,
             enable_causal_log_rescale=enable_causal_log_rescale,

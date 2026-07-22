@@ -40,16 +40,9 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
 
     def _run_feature_extractor(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, padding_side: str = "right"
-    ) -> torch.Tensor:
-        encoded_text_features = torch.stack(hidden_states, dim=-1)
-        encoded_text_features_dtype = encoded_text_features.dtype
-
-        sequence_lengths = attention_mask.sum(dim=-1)
-        normed_concated_encoded_text_features = _norm_and_concat_padded_batch(
-            encoded_text_features, sequence_lengths, padding_side=padding_side
-        )
-
-        return self.feature_extractor_linear(normed_concated_encoded_text_features.to(encoded_text_features_dtype))
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del padding_side
+        return self.feature_extractor_linear(hidden_states, attention_mask)
 
     def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return (attention_mask - 1).to(dtype).reshape(
@@ -67,7 +60,11 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
         input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
         attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        outputs = self.model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
         projected = self._run_feature_extractor(
             hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
         )

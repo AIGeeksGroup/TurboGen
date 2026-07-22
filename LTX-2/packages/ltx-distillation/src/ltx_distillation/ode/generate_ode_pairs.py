@@ -31,7 +31,8 @@ Based on CausVid's generate_ode_pairs.py, adapted for LTX-2 audio-video.
 
 import os
 import math
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Optional, Dict, List, Tuple, Any
 
@@ -39,6 +40,10 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from tqdm import tqdm
+
+
+ODE_FORMAT_VERSION = 4
+ODE_PRODUCER = "omniforcing-ltx23-full-architecture-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +160,8 @@ class LTX2ODEPairGenerator(nn.Module):
         self._teacher = None
         self._text_encoder = None
         self._scheduler = None
+        self._video_vae = None
+        self._audio_vae = None
 
     def _load_models(self, device: torch.device):
         """Load teacher model, text encoder, and (optionally) VAE for preview."""
@@ -182,17 +189,9 @@ class LTX2ODEPairGenerator(nn.Module):
             device=device,
             video_height=self.config.video_height,
             video_width=self.config.video_width,
+            fp8_mode="static",
         )
         self._teacher.eval()
-
-        from ltx_distillation.models.vae_wrapper import create_vae_wrappers
-
-        self._video_vae, self._audio_vae = create_vae_wrappers(
-            checkpoint_path=self.config.teacher_checkpoint,
-            device=device,
-        )
-        self._video_vae.eval()
-        self._audio_vae.eval()
 
         # Use LTX-2's native scheduler (sigmoid shift + stretch) for generating
         # the denoising sigma schedule. This matches the original inference pipeline.
@@ -404,6 +403,10 @@ class LTX2ODEPairGenerator(nn.Module):
         clean_audio_latent = audio_trajectory[:, -1]   # [1, F_a, C]
 
         return {
+            "format_version": ODE_FORMAT_VERSION,
+            "producer": ODE_PRODUCER,
+            "teacher_checkpoint": os.path.abspath(self.config.teacher_checkpoint),
+            "generation_config": asdict(self.config),
             "prompt": prompt,
             "video_trajectory": video_trajectory,
             "audio_trajectory": audio_trajectory,
@@ -421,6 +424,15 @@ class LTX2ODEPairGenerator(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         """Decode the clean (sigma=0) latent and save as .mp4 with audio."""
+        if self._video_vae is None or self._audio_vae is None:
+            from ltx_distillation.models.vae_wrapper import create_vae_wrappers
+
+            self._video_vae, self._audio_vae = create_vae_wrappers(
+                checkpoint_path=self.config.teacher_checkpoint,
+                device=device,
+            )
+            self._video_vae.eval()
+            self._audio_vae.eval()
         try:
             from ltx_pipelines.utils.encode_video import encode_video
         except ImportError:
@@ -443,7 +455,7 @@ class LTX2ODEPairGenerator(nn.Module):
             video=pixel_video,
             fps=24.0,
             audio=waveform,
-            audio_sample_rate=24000,
+            audio_sample_rate=48000,
             output_path=mp4_path,
             video_chunks_number=1,
         )
@@ -494,9 +506,41 @@ class LTX2ODEPairGenerator(nn.Module):
         rank, world_size = _get_rank_info()
         device = torch.cuda.current_device()
 
-        # Rank 0 creates output dir before anyone writes
+        # Rank 0 creates and validates provenance before anyone writes samples.
+        manifest_error = ""
         if rank == 0:
-            os.makedirs(output_dir, exist_ok=True)
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                manifest_path = os.path.join(output_dir, "manifest.json")
+                manifest = {
+                    "format_version": ODE_FORMAT_VERSION,
+                    "producer": ODE_PRODUCER,
+                    "teacher_checkpoint": os.path.abspath(self.config.teacher_checkpoint),
+                    "generation_config": asdict(self.config),
+                }
+                if os.path.exists(manifest_path):
+                    with open(manifest_path, "r", encoding="utf-8") as handle:
+                        existing_manifest = json.load(handle)
+                    if existing_manifest != manifest:
+                        raise RuntimeError(
+                            f"ODE output manifest mismatch in {output_dir}; use a new directory"
+                        )
+                else:
+                    existing_pairs = [name for name in os.listdir(output_dir) if name.endswith(".pt")]
+                    if existing_pairs:
+                        raise RuntimeError(
+                            f"Refusing to mix unversioned ODE pairs into {output_dir}"
+                        )
+                    with open(manifest_path, "w", encoding="utf-8") as handle:
+                        json.dump(manifest, handle, indent=2, sort_keys=True)
+            except Exception as exc:
+                manifest_error = str(exc)
+        if dist.is_initialized():
+            errors = [manifest_error]
+            dist.broadcast_object_list(errors, src=0)
+            manifest_error = errors[0]
+        if manifest_error:
+            raise RuntimeError(manifest_error)
         if dist.is_initialized():
             dist.barrier()
 
@@ -506,6 +550,7 @@ class LTX2ODEPairGenerator(nn.Module):
 
         generated = 0
         skipped = 0
+        errors: list[str] = []
 
         pbar = tqdm(
             range(iters_per_rank),
@@ -522,7 +567,7 @@ class LTX2ODEPairGenerator(nn.Module):
             output_path = os.path.join(output_dir, f"{prompt_idx:06d}.pt")
 
             # Resume: skip already-generated files
-            if skip_existing and os.path.exists(output_path):
+            if skip_existing and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
                 skipped += 1
                 continue
 
@@ -535,17 +580,56 @@ class LTX2ODEPairGenerator(nn.Module):
                     device=device,
                     dtype=dtype,
                 )
-                torch.save(trajectory, output_path)
+                temporary_path = f"{output_path}.tmp.{os.getpid()}"
+                try:
+                    torch.save(trajectory, temporary_path)
+                    os.replace(temporary_path, output_path)
+                finally:
+                    if os.path.exists(temporary_path):
+                        os.unlink(temporary_path)
                 generated += 1
 
-            
             except Exception as e:
-                print(f"[rank {rank}] Error generating prompt {prompt_idx}: {e}")
-                continue
+                message = f"prompt {prompt_idx}: {type(e).__name__}: {e}"
+                errors.append(message)
+                print(f"[rank {rank}] Error generating {message}", flush=True)
 
         # Wait for all ranks before printing summary
         if dist.is_initialized():
             dist.barrier()
+
+            error_count = torch.tensor(
+                [len(errors)],
+                device=torch.device("cuda", torch.cuda.current_device()),
+                dtype=torch.int64,
+            )
+            dist.all_reduce(error_count, op=dist.ReduceOp.SUM)
+            total_errors = int(error_count.item())
+        else:
+            total_errors = len(errors)
+
+        if total_errors:
+            detail = "; ".join(errors[:5]) or "another rank reported a generation failure"
+            raise RuntimeError(
+                f"ODE generation failed for {total_errors} prompt(s); first local errors: {detail}"
+            )
+
+        # Rank zero verifies that every requested prompt has an atomic output.
+        missing = []
+        if rank == 0:
+            missing = [
+                index
+                for index in range(total_prompts)
+                if not os.path.isfile(os.path.join(output_dir, f"{index:06d}.pt"))
+            ]
+        if dist.is_initialized():
+            missing_holder = [missing]
+            dist.broadcast_object_list(missing_holder, src=0)
+            missing = missing_holder[0]
+        if missing:
+            raise RuntimeError(
+                f"ODE generation completed without outputs for prompt indices: {missing[:20]}"
+            )
 
         print(f"[rank {rank}] Done. generated={generated}, skipped={skipped}")
 
@@ -574,6 +658,12 @@ def main():
                         help="CFG scale for audio (LTX-2 native default: 7.0)")
     parser.add_argument("--rescale_scale", type=float, default=0.7,
                         help="CFG rescale factor (LTX-2 native default: 0.7)")
+    parser.add_argument(
+        "--denoising_step_list",
+        type=str,
+        default="1000,909,725,421,0",
+        help="Stored ODE sigma points, from noise to clean.",
+    )
     parser.add_argument("--negative_prompt", type=str, default=None,
                         help="Negative prompt for CFG (default: LTX-2 official)")
     parser.add_argument("--no_skip_existing", action="store_true",
@@ -612,6 +702,11 @@ def main():
         video_guidance_scale=args.video_guidance_scale,
         audio_guidance_scale=args.audio_guidance_scale,
         rescale_scale=args.rescale_scale,
+        denoising_step_list=[
+            int(item.strip())
+            for item in args.denoising_step_list.split(",")
+            if item.strip()
+        ],
     )
     if args.negative_prompt is not None:
         config_kwargs["negative_prompt"] = args.negative_prompt

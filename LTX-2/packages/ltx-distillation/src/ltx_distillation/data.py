@@ -3,6 +3,7 @@ Dataset classes for DMD distillation.
 """
 
 import os
+import json
 from typing import List, Optional
 
 import numpy as np
@@ -96,6 +97,12 @@ class ODERegressionLMDBDataset(Dataset):
 
             # Get shape metadata
             with self.env.begin(write=False) as txn:
+                manifest_bytes = txn.get(b"manifest_json")
+                self.manifest = (
+                    json.loads(manifest_bytes.decode("utf-8"))
+                    if manifest_bytes
+                    else None
+                )
                 # Parse video shape: "[total, T, F, C, H, W]"
                 video_shape_bytes = txn.get("video_latents_shape".encode())
                 if video_shape_bytes is None:

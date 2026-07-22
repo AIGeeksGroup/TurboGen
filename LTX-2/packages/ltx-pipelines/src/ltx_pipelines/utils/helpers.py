@@ -319,13 +319,21 @@ def modality_from_latent_state(
     Constructs a Modality object with the latent state's data, timesteps derived
     from the denoise mask and sigma, positions, and the provided context.
     """
+    sigma_tensor = torch.as_tensor(sigma, device=state.latent.device, dtype=state.latent.dtype)
+    if sigma_tensor.ndim == 0:
+        sigma_tensor = sigma_tensor.expand(state.latent.shape[0])
+    elif sigma_tensor.ndim > 1:
+        sigma_tensor = sigma_tensor.reshape(sigma_tensor.shape[0], -1)[:, 0]
+
     return Modality(
         enabled=enabled,
         latent=state.latent,
+        sigma=sigma_tensor,
         timesteps=timesteps_from_mask(state.denoise_mask, sigma),
         positions=state.positions,
         context=context,
         context_mask=None,
+        attention_mask=getattr(state, "attention_mask", None),
     )
 
 
@@ -334,6 +342,8 @@ def timesteps_from_mask(denoise_mask: torch.Tensor, sigma: float | torch.Tensor)
     Multiplies the denoise mask by sigma to produce timesteps for each position
     in the latent state. Areas where the mask is 0 will have zero timesteps.
     """
+    if isinstance(sigma, torch.Tensor) and sigma.dim() == 1:
+        sigma = sigma.view(-1, *([1] * (denoise_mask.dim() - 1)))
     return denoise_mask * sigma
 
 

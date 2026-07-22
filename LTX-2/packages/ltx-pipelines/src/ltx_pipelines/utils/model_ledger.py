@@ -1,10 +1,10 @@
-from dataclasses import replace
-
 import torch
 
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader, SafetensorsStateDictLoader
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
     VOCODER_COMFY_KEYS_FILTER,
@@ -15,10 +15,9 @@ from ltx_core.model.audio_vae import (
 )
 from ltx_core.model.transformer import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
-    LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
-    UPCAST_DURING_INFERENCE,
     LTXModelConfigurator,
     X0Model,
+    static_fp8_module_op,
 )
 from ltx_core.model.upsampler import LatentUpsampler, LatentUpsamplerConfigurator
 from ltx_core.model.video_vae import (
@@ -79,7 +78,8 @@ class ModelLedger:
         Optional :class:`Registry` instance for weight caching across builders.
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
     fp8transformer:
-        If ``True``, builds the transformer with FP8 quantization and upcasting during inference.
+        If ``True``, loads the checkpoint's native FP8 weights and scales and
+        executes frozen transformer Linear layers with scaled-mm.
     ### Creating Variants
     Use :meth:`with_loras` to create a new ``ModelLedger`` instance that includes
     additional LoRA configurations while sharing the same registry for weight caching.
@@ -108,11 +108,30 @@ class ModelLedger:
 
     def build_model_builders(self) -> None:
         if self.checkpoint_path is not None:
+            component_loader = SafetensorsModelStateDictLoader(
+                weight_loader=SafetensorsStateDictLoader(fold_prequantized_fp8=True)
+            )
+            transformer_loader = component_loader
+            transformer_module_ops = ()
+            transformer_sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
+            if self.fp8transformer:
+                if self.loras:
+                    raise ValueError("LoRA fusion is not supported by the frozen static FP8 teacher")
+                transformer_loader = SafetensorsModelStateDictLoader(
+                    weight_loader=SafetensorsStateDictLoader(preserve_prequantized_fp8=True)
+                )
+                transformer_module_ops = (static_fp8_module_op(self.checkpoint_path),)
+                transformer_sd_ops = SDOps(
+                    "LTXV_MODEL_COMFY_STATIC_FP8_PREFIX_MAP",
+                    LTXV_MODEL_COMFY_RENAMING_MAP.mapping,
+                )
             self.transformer_builder = Builder(
                 model_path=self.checkpoint_path,
                 model_class_configurator=LTXModelConfigurator,
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                model_sd_ops=transformer_sd_ops,
                 loras=tuple(self.loras),
+                model_loader=transformer_loader,
+                module_ops=transformer_module_ops,
                 registry=self.registry,
             )
 
@@ -153,6 +172,7 @@ class ModelLedger:
                     model_path=(str(self.checkpoint_path), *weight_paths),
                     model_class_configurator=AVGemmaTextEncoderModelConfigurator,
                     model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+                    model_loader=component_loader,
                     registry=self.registry,
                     module_ops=(GEMMA_MODEL_OPS, *module_ops),
                 )
@@ -188,12 +208,7 @@ class ModelLedger:
                 "Transformer not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
         if self.fp8transformer:
-            fp8_builder = replace(
-                self.transformer_builder,
-                module_ops=(UPCAST_DURING_INFERENCE,),
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
-            )
-            return X0Model(fp8_builder.build(device=self._target_device())).to(self.device).eval()
+            return X0Model(self.transformer_builder.build(device=self._target_device())).to(self.device).eval()
         else:
             return (
                 X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))

@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from ltx_causal.attention.mask_builder import compute_av_blocks
+
 
 @dataclass
 class ODERegressionConfig:
@@ -92,6 +94,10 @@ class ODERegressionConfig:
     video_loss_weight: float = 1.0
     audio_loss_weight: float = 0.0
 
+    # Refuse legacy/default architecture fallbacks when training from LTX-2.3.
+    require_ltx23_architecture: bool = True
+    trainable_fp8_mode: str = "training"
+
 
 class LTX2ODERegression(nn.Module):
     """
@@ -159,26 +165,45 @@ class LTX2ODERegression(nn.Module):
         from ltx_causal import CausalLTXModelConfig
 
         checkpoint_config = self._load_checkpoint_config(self.config.checkpoint_path)
-        use_caption_projection = not (
-            checkpoint_config.get("caption_proj_before_connector", False)
-            and not checkpoint_config.get("caption_projection_first_linear", True)
-            and not checkpoint_config.get("caption_projection_second_linear", True)
-        )
-
-        return CausalLTXModelConfig(
+        if self.config.require_ltx23_architecture:
+            if not checkpoint_config:
+                raise ValueError(
+                    "LTX-2.3 training requires architecture metadata in checkpoint_path"
+                )
+            transformer_config = checkpoint_config.get("transformer", checkpoint_config)
+            required = {
+                "rope_type": "split",
+                "cross_attention_adaln": True,
+                "apply_gated_attention": True,
+            }
+            mismatched = {
+                key: (transformer_config.get(key), expected)
+                for key, expected in required.items()
+                if transformer_config.get(key) != expected
+            }
+            if mismatched:
+                raise ValueError(
+                    f"checkpoint_path is not the expected LTX-2.3 architecture: {mismatched}"
+                )
+        return CausalLTXModelConfig.from_checkpoint_config(
+            checkpoint_config,
             num_frame_per_block=self.config.num_frame_per_block,
             num_frame_per_block_first=self.config.num_frame_per_block_first,
             enable_causal_log_rescale=self.config.enable_causal_log_rescale,
-            caption_channels=checkpoint_config.get("caption_channels", 3840),
-            cross_attention_dim=checkpoint_config.get("cross_attention_dim", 4096),
-            audio_cross_attention_dim=checkpoint_config.get("audio_cross_attention_dim", 2048),
-            use_caption_projection=use_caption_projection,
         )
 
     def _make_wrapper(self, model):
         """Create CausalLTX2DiffusionWrapper from ODE config (avoids repetition)."""
         from ltx_causal import CausalLTX2DiffusionWrapper
-        return CausalLTX2DiffusionWrapper(
+        from ltx_core.model.transformer import checkpoint_fp8_module_names, convert_to_fp8_training
+
+        if self.config.trainable_fp8_mode != "training":
+            raise ValueError("Step 2 requires trainable_fp8_mode='training'")
+        convert_to_fp8_training(
+            model,
+            checkpoint_fp8_module_names(self.config.checkpoint_path),
+        )
+        wrapper = CausalLTX2DiffusionWrapper(
             model=model,
             video_height=self.config.video_height,
             video_width=self.config.video_width,
@@ -186,6 +211,30 @@ class LTX2ODERegression(nn.Module):
             num_frame_per_block_first=self.config.num_frame_per_block_first,
             disable_causal_mask=self.config.disable_causal_mask,
         )
+        wrapper.fp8_mode = "training"
+        return wrapper
+
+    @staticmethod
+    def _assert_compatible_load(missing, unexpected, source: str) -> None:
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Incompatible causal checkpoint {source}: "
+                f"missing={len(missing)} unexpected={len(unexpected)}; "
+                f"missing_examples={list(missing)[:10]} "
+                f"unexpected_examples={list(unexpected)[:10]}. "
+                "Do not train with a partially loaded LTX-2.3 model."
+            )
+
+    @staticmethod
+    def _strict_load(module: nn.Module, state_dict: dict, source: str) -> None:
+        try:
+            module.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Incompatible LTX-2.3 checkpoint: {source}. "
+                "Legacy 6-way Step-2 checkpoints cannot initialize the corrected "
+                "9-way/gated LTX-2.3 model."
+            ) from exc
 
     def _load_models(self):
         """
@@ -256,13 +305,17 @@ class LTX2ODERegression(nn.Module):
         if self.config.causal_model_checkpoint:
             # Option 1: Load from existing causal checkpoint
             self._print(f"Loading causal model from: {self.config.causal_model_checkpoint}")
-            self._generator = CausalLTX2DiffusionWrapper.from_pretrained(
+            model = CausalLTXModel(self._make_model_config())
+            self._generator = self._make_wrapper(model).to(self.device, self.dtype)
+            state_dict = self._load_checkpoint_state_dict(
+                self.config.causal_model_checkpoint
+            )
+            state_dict = self._remap_state_dict_keys(state_dict)
+            self._strict_load(
+                self._generator,
+                state_dict,
                 self.config.causal_model_checkpoint,
-                num_frame_per_block=self.config.num_frame_per_block,
-                num_frame_per_block_first=self.config.num_frame_per_block_first,
-                disable_causal_mask=self.config.disable_causal_mask,
-                enable_causal_log_rescale=self.config.enable_causal_log_rescale,
-            ).to(self.device)
+            )
 
         elif self.config.bidirectional_model_checkpoint:
             # Option 2: Load from bidirectional DMD checkpoint
@@ -288,15 +341,12 @@ class LTX2ODERegression(nn.Module):
             state_dict = self._remap_state_dict_keys(bidirectional_state_dict)
 
             # Load with strict=False (causal model has KV cache-related keys)
-            missing, unexpected = self._generator.load_state_dict(state_dict, strict=False)
-            self._print(f"Loaded bidirectional weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-            if missing:
-                # Filter out expected missing keys (mask_builder, audio_sink_tokens, etc.)
-                real_missing = [k for k in missing if 'mask_builder' not in k and 'causal_gate' not in k and 'audio_sink_tokens' not in k]
-                if real_missing:
-                    self._print(f"  Missing keys: {real_missing[:10]}...")
-            if unexpected:
-                self._print(f"  Unexpected keys: {unexpected[:10]}...")
+            self._strict_load(
+                self._generator,
+                state_dict,
+                self.config.bidirectional_model_checkpoint,
+            )
+            self._print("Loaded bidirectional weights with full architecture compatibility")
 
             # For eval-time bootstrap rounds, use the exact original bidirectional
             # wrapper instead of rebuilding one from the causal model config.
@@ -307,8 +357,9 @@ class LTX2ODERegression(nn.Module):
                 gemma_path=self.config.text_encoder_checkpoint,
                 device=torch.device("cpu"),
                 dtype=self.dtype,
+                fp8_mode="static",
             )
-            delegate.load_state_dict(bidirectional_state_dict, strict=False)
+            delegate.load_state_dict(bidirectional_state_dict, strict=True)
             delegate.eval()
             self._generator.set_bidirectional_delegate(delegate)
 
@@ -325,14 +376,8 @@ class LTX2ODERegression(nn.Module):
             )
             state_dict = self._remap_state_dict_keys(state_dict)
 
-            missing, unexpected = self._generator.load_state_dict(state_dict, strict=False)
-            self._print(f"Loaded original LTX-2 weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-            if missing:
-                real_missing = [k for k in missing if 'mask_builder' not in k and 'causal_gate' not in k and 'audio_sink_tokens' not in k]
-                if real_missing:
-                    self._print(f"  Missing keys: {real_missing[:10]}...")
-            if unexpected:
-                self._print(f"  Unexpected keys: {unexpected[:10]}...")
+            self._strict_load(self._generator, state_dict, self.config.checkpoint_path)
+            self._print("Loaded original LTX-2 weights with full architecture compatibility")
 
         else:
             raise ValueError(
@@ -342,7 +387,7 @@ class LTX2ODERegression(nn.Module):
             )
 
         self._verify_weights_loaded()
-        self._print("[Checkpoint Load] Loaded weights as-is, no modification applied.")
+        self._print("[Checkpoint Load] Model weights loaded and validated.")
 
         # Set gradient requirements
         self._generator.requires_grad_(True)
@@ -366,42 +411,30 @@ class LTX2ODERegression(nn.Module):
     @staticmethod
     def _load_checkpoint_config(checkpoint_path: str) -> dict:
         """Read model config stored in a safetensors checkpoint metadata."""
-        if not checkpoint_path or not checkpoint_path.endswith(".safetensors"):
+        if not checkpoint_path:
             return {}
-        try:
-            import json
-            from safetensors import safe_open
+        from ltx_causal.checkpoint import load_checkpoint_config
 
-            with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-                metadata = f.metadata() or {}
-            raw_config = metadata.get("config")
-            if not raw_config:
-                return {}
-            parsed = json.loads(raw_config)
-            if isinstance(parsed, dict) and isinstance(parsed.get("transformer"), dict):
-                flattened = dict(parsed["transformer"])
-                flattened.update({k: v for k, v in parsed.items() if k != "transformer"})
-                return flattened
-            return parsed
-        except Exception:
-            return {}
+        return load_checkpoint_config(checkpoint_path)
 
     @staticmethod
     def _load_checkpoint_state_dict(checkpoint_path: str) -> dict:
         """Load state dict from a checkpoint file (safetensors or .pt)."""
-        if checkpoint_path.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            return load_file(checkpoint_path)
-        else:
-            loaded = torch.load(checkpoint_path, map_location='cpu')
-            if isinstance(loaded, dict) and 'generator' in loaded:
-                return loaded['generator']
-            elif isinstance(loaded, dict) and 'model' in loaded:
-                return loaded['model']
-            elif isinstance(loaded, dict) and 'state_dict' in loaded:
-                return loaded['state_dict']
-            else:
-                return loaded
+        from ltx_causal.checkpoint import load_checkpoint_state_dict
+
+        return load_checkpoint_state_dict(checkpoint_path)
+
+    @staticmethod
+    def _fold_prequantized_fp8_scales(state_dict: dict) -> dict:
+        """Reconstruct Student optimizer master weights from static FP8 tensors.
+
+        LTX-2.3 FP8 checkpoints store a quantized tensor alongside a scalar
+        ``*_scale`` tensor. AdamW updates a BF16 master; after loading, torchao
+        performs the Student Linear forward/backward GEMMs in FP8.
+        """
+        from ltx_causal.checkpoint import fold_prequantized_fp8_scales
+
+        return fold_prequantized_fp8_scales(state_dict)
 
     # Prefixes in the full LTX-2 checkpoint that are NOT transformer weights.
     # These must be filtered out when loading into the causal model.
@@ -419,7 +452,18 @@ class LTX2ODERegression(nn.Module):
     )
 
     @staticmethod
-    def _remap_state_dict_keys(state_dict: dict) -> dict:
+    def _remap_state_dict_keys(state_dict: dict, *, preserve_fp8: bool = False) -> dict:
+        """Map an LTX checkpoint to CausalLTX2DiffusionWrapper keys."""
+        from ltx_causal.checkpoint import remap_transformer_state_dict
+
+        return remap_transformer_state_dict(
+            state_dict,
+            target_prefix="model.",
+            preserve_fp8=preserve_fp8,
+        )
+
+    @staticmethod
+    def _legacy_remap_state_dict_keys(state_dict: dict) -> dict:
         """Remap state dict keys to match CausalLTX2DiffusionWrapper structure.
 
         Handles four source formats:
@@ -437,6 +481,8 @@ class LTX2ODERegression(nn.Module):
         """
         if not state_dict:
             return state_dict
+
+        state_dict = LTX2ODERegression._fold_prequantized_fp8_scales(state_dict)
 
         # Check if this is a full checkpoint (contains model.diffusion_model.* keys)
         # We check a sample of keys rather than just the first one, because key
@@ -472,7 +518,7 @@ class LTX2ODERegression(nn.Module):
                 # Skip non-transformer keys (vae.*, audio_vae.*, vocoder.*, etc.)
             if skipped > 0:
                 print(f"  Filtered {skipped} text encoder keys (embeddings_connector)")
-            return LTX2ODERegression._adapt_ltx23_adaln_state_dict(remapped)
+            return remapped
 
         # Check first key to detect remaining formats
         first_key = next(iter(state_dict))
@@ -487,7 +533,7 @@ class LTX2ODERegression(nn.Module):
                     new_key = "model." + k[len("model.velocity_model."):]
                     remapped[new_key] = v
                 # Skip non-transformer keys
-            return LTX2ODERegression._adapt_ltx23_adaln_state_dict(remapped)
+            return remapped
 
         elif first_key.startswith("model."):
             # Format 3: Already causal wrapper format
@@ -497,56 +543,20 @@ class LTX2ODERegression(nn.Module):
                 for p in LTX2ODERegression._NON_TRANSFORMER_PREFIXES
             )
             if has_non_transformer:
-                return LTX2ODERegression._adapt_ltx23_adaln_state_dict({
+                return {
                     k: v for k, v in state_dict.items()
                     if not any(k.startswith(p) for p in LTX2ODERegression._NON_TRANSFORMER_PREFIXES)
-                })
-            return LTX2ODERegression._adapt_ltx23_adaln_state_dict(state_dict)
+                }
+            return state_dict
 
         else:
             # Format 1: Raw LTXModel keys (from extracted checkpoint)
             # xxx → model.xxx, but filter out non-transformer keys
             print("  Remapping raw LTX keys: * → model.*")
-            return LTX2ODERegression._adapt_ltx23_adaln_state_dict({
+            return {
                 "model." + k: v for k, v in state_dict.items()
                 if not any(k.startswith(p) for p in LTX2ODERegression._NON_TRANSFORMER_PREFIXES)
-            })
-
-    @staticmethod
-    def _adapt_ltx23_adaln_state_dict(state_dict: dict) -> dict:
-        """Adapt LTX-2.3 9-way AdaLN tensors to the 6-way causal wrapper.
-
-        LTX-2.3 stores three extra AdaLN rows/groups. The current causal block
-        consumes the first three self-attention groups and the last three
-        feed-forward groups, so keep [0:3] and [6:9].
-        """
-        adapted = {}
-        converted = 0
-
-        for key, value in state_dict.items():
-            should_convert_table = key.endswith("scale_shift_table")
-            should_convert_linear = (
-                key in (
-                    "model.adaln_single.linear.weight",
-                    "model.adaln_single.linear.bias",
-                    "model.audio_adaln_single.linear.weight",
-                    "model.audio_adaln_single.linear.bias",
-                )
-            )
-
-            if should_convert_table and value.ndim == 2 and value.shape[0] == 9:
-                value = torch.cat([value[:3], value[6:]], dim=0)
-                converted += 1
-            elif should_convert_linear and value.shape[0] % 9 == 0:
-                dim = value.shape[0] // 9
-                value = torch.cat([value[: 3 * dim], value[6 * dim :]], dim=0)
-                converted += 1
-
-            adapted[key] = value
-
-        if converted:
-            print(f"  Adapted {converted} LTX-2.3 AdaLN tensors from 9-way to 6-way")
-        return adapted
+            }
 
     def _verify_weights_loaded(self):
         """Verify critical parameters were loaded from checkpoint.
@@ -580,14 +590,11 @@ class LTX2ODERegression(nn.Module):
                       f"mean={pf.mean().item():.4f} std={pf.std().item():.4f}")
 
         if problems:
-            self._print("\n" + "=" * 60)
-            self._print("WARNING: Weight loading problems detected!")
-            self._print("=" * 60)
-            for p in problems:
-                self._print(p)
-            self._print("=" * 60 + "\n")
-        else:
-            self._print("[Weight Check] All parameters look OK (no NaN/Inf/extreme values)")
+            raise RuntimeError(
+                "Loaded checkpoint contains invalid or uninitialized parameters:\n"
+                + "\n".join(problems)
+            )
+        self._print("[Weight Check] All parameters look OK (no NaN/Inf/extreme values)")
 
     @property
     def generator(self) -> nn.Module:
@@ -721,18 +728,11 @@ class LTX2ODERegression(nn.Module):
         noisy_audio = None
         if audio_latent is not None:
             B, T, F_a, C_a = audio_latent.shape
-
-            # For audio, we need to align timesteps with video
-            # Use the same timestep pattern but expanded to audio frames
-            # Audio frames per video frame ratio
-            audio_per_video = F_a / F_v
-
-            # Create audio frame indices
-            audio_index = torch.zeros(B, F_a, dtype=torch.long, device=self.device)
-            for i in range(F_v):
-                start = round(i * audio_per_video)
-                end = round((i + 1) * audio_per_video) if i < F_v - 1 else F_a
-                audio_index[:, start:end] = index[:, i:i+1].expand(-1, end - start)
+            audio_index = self._expand_video_blocks_to_audio(
+                index,
+                F_a,
+                value_name="trajectory index",
+            )
 
             noisy_audio = torch.gather(
                 audio_latent,
@@ -742,21 +742,53 @@ class LTX2ODERegression(nn.Module):
 
         return noisy_video, noisy_audio, sigma
 
+    def _expand_video_blocks_to_audio(
+        self,
+        values: torch.Tensor,
+        audio_frames: int,
+        *,
+        value_name: str,
+    ) -> torch.Tensor:
+        """Expand block-uniform video values to the aligned audio blocks."""
+        if values.ndim != 2:
+            raise ValueError(f"Expected {value_name} with shape [B, F_v], got {tuple(values.shape)}")
+
+        batch_size, video_frames = values.shape
+        blocks = compute_av_blocks(
+            total_video_latent_frames=video_frames,
+            num_frame_per_block=self.config.num_frame_per_block,
+            num_frame_per_block_first=self.config.num_frame_per_block_first,
+        )
+        expected_audio_frames = blocks[-1].audio_end
+        if audio_frames != expected_audio_frames:
+            raise ValueError(
+                "Audio trajectory does not match the causal AV block layout: "
+                f"got F_a={audio_frames}, expected {expected_audio_frames} for F_v={video_frames}"
+            )
+
+        expanded = values.new_empty((batch_size, audio_frames))
+        for block in blocks:
+            video_block = values[:, block.video_start : block.video_end]
+            reference = video_block[:, :1]
+            if not torch.equal(video_block, reference.expand_as(video_block)):
+                raise ValueError(
+                    f"Video {value_name} is not uniform in causal block {block.block_idx}: "
+                    f"video=[{block.video_start}:{block.video_end}]"
+                )
+            expanded[:, block.audio_start : block.audio_end] = reference
+        return expanded
+
     def _expand_video_sigma_to_audio(
         self,
         sigma: torch.Tensor,
         F_a: int,
     ) -> torch.Tensor:
         """Expand video-frame sigma [B, F_v] to audio-frame sigma [B, F_a]."""
-        B = sigma.shape[0]
-        F_v = sigma.shape[1]
-        audio_per_video = F_a / F_v
-        audio_sigma = torch.zeros(B, F_a, dtype=sigma.dtype, device=self.device)
-        for i in range(F_v):
-            start = round(i * audio_per_video)
-            end = round((i + 1) * audio_per_video) if i < F_v - 1 else F_a
-            audio_sigma[:, start:end] = sigma[:, i:i+1].expand(-1, end - start)
-        return audio_sigma
+        return self._expand_video_blocks_to_audio(
+            sigma,
+            F_a,
+            value_name="sigma",
+        )
 
     def _expand_video_mask_to_audio(
         self,
@@ -764,15 +796,11 @@ class LTX2ODERegression(nn.Module):
         F_a: int,
     ) -> torch.Tensor:
         """Expand video-frame mask [B, F_v] to audio-frame mask [B, F_a]."""
-        B = mask.shape[0]
-        F_v = mask.shape[1]
-        audio_per_video = F_a / F_v
-        audio_mask = torch.zeros(B, F_a, dtype=torch.bool, device=self.device)
-        for i in range(F_v):
-            start = round(i * audio_per_video)
-            end = round((i + 1) * audio_per_video) if i < F_v - 1 else F_a
-            audio_mask[:, start:end] = mask[:, i:i+1]
-        return audio_mask
+        return self._expand_video_blocks_to_audio(
+            mask,
+            F_a,
+            value_name="loss mask",
+        )
 
     @staticmethod
     def _x0_to_velocity(

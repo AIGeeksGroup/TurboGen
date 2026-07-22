@@ -11,7 +11,7 @@ Model Architecture:
 - Model input projection: Linear(128, 4096)
 """
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Literal
 import torch
 import torch.nn as nn
 
@@ -94,7 +94,10 @@ class LTX2DiffusionWrapper(nn.Module):
         Args:
             module_grad: Dict mapping component names to requires_grad flags
         """
-        if module_grad.get("model", True):
+        train_model = module_grad.get("model", True)
+        if train_model and getattr(self, "fp8_mode", None) == "static":
+            raise RuntimeError("A static FP8 Teacher is frozen and cannot be made trainable")
+        if train_model:
             self.model.requires_grad_(True)
         else:
             self.model.requires_grad_(False)
@@ -368,6 +371,7 @@ class LTX2DiffusionWrapper(nn.Module):
         # Build video modality
         video_modality = Modality(
             latent=video_flat,
+            sigma=timestep if timestep.ndim == 1 else timestep[:, 0],
             timesteps=video_timesteps,
             positions=video_positions,
             context=conditional_dict["video_context"],
@@ -401,6 +405,7 @@ class LTX2DiffusionWrapper(nn.Module):
 
             audio_modality = Modality(
                 latent=noisy_audio,
+                sigma=audio_timestep if audio_timestep.ndim == 1 else audio_timestep[:, 0],
                 timesteps=audio_timesteps,
                 positions=audio_positions,
                 context=conditional_dict["audio_context"],
@@ -427,7 +432,7 @@ class LTX2DiffusionWrapper(nn.Module):
 
         return video_x0, audio_x0
 
-    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True) -> None:
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
         """Load state dict, handling potential key mismatches."""
         # Remove 'model.' prefix if present
         new_state_dict = {}
@@ -437,7 +442,7 @@ class LTX2DiffusionWrapper(nn.Module):
             else:
                 new_state_dict[f"model.{k}"] = v
 
-        super().load_state_dict(new_state_dict, strict=strict)
+        return super().load_state_dict(new_state_dict, strict=strict)
 
 
 def create_ltx2_wrapper(
@@ -448,6 +453,7 @@ def create_ltx2_wrapper(
     video_height: int = 512,
     video_width: int = 768,
     registry=None,
+    fp8_mode: Literal["static", "training"] = "training",
 ) -> LTX2DiffusionWrapper:
     """
     Factory function to create LTX2DiffusionWrapper from checkpoint.
@@ -468,16 +474,27 @@ def create_ltx2_wrapper(
     # IMPORTANT: Load to CPU first, then move to target device
     # safetensors doesn't support device indices like "cuda:4"
     # It only accepts "cuda" or "cpu"
+    if fp8_mode not in {"static", "training"}:
+        raise ValueError(f"Unsupported fp8_mode: {fp8_mode!r}")
+
     ledger = ModelLedger(
         dtype=dtype,
         device=torch.device("cpu"),  # Load to CPU first
         checkpoint_path=checkpoint_path,
         gemma_root_path=gemma_path,
-        fp8transformer="fp8" in str(checkpoint_path).lower(),
+        fp8transformer=fp8_mode == "static",
     )
 
     # Get X0Model (wraps velocity model)
     x0_model = ledger.transformer()
+
+    if fp8_mode == "training":
+        from ltx_core.model.transformer import checkpoint_fp8_module_names, convert_to_fp8_training
+
+        convert_to_fp8_training(
+            x0_model.velocity_model,
+            checkpoint_fp8_module_names(checkpoint_path),
+        )
 
     # Move to target device
     x0_model = x0_model.to(device=device, dtype=dtype)
@@ -487,5 +504,10 @@ def create_ltx2_wrapper(
         video_height=video_height,
         video_width=video_width,
     )
+
+    wrapper.fp8_mode = fp8_mode
+    if fp8_mode == "static":
+        wrapper.requires_grad_(False)
+        wrapper.eval()
 
     return wrapper

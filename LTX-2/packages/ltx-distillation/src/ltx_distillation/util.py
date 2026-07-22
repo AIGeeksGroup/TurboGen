@@ -9,6 +9,8 @@ Includes:
 
 import os
 import random
+import subprocess
+import sys
 from typing import Optional, Tuple, Any
 from datetime import datetime, timedelta
 from functools import partial
@@ -36,6 +38,38 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+
+def capture_rng_state(device: Optional[torch.device] = None) -> dict:
+    """Capture every RNG used by the training code on the current rank."""
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
+def restore_rng_state(state: dict, device: Optional[torch.device] = None) -> None:
+    """Strictly restore a state produced by :func:`capture_rng_state`."""
+    required = {"python", "numpy", "torch"}
+    if torch.cuda.is_available():
+        required.add("cuda")
+    missing = sorted(required.difference(state))
+    if missing:
+        raise RuntimeError(f"Checkpoint RNG state is incomplete: missing {missing}")
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available():
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        torch.cuda.set_rng_state(state["cuda"], device=device)
 
 
 def launch_distributed_job() -> None:
@@ -165,6 +199,284 @@ def fsdp_state_dict(module: FSDP) -> dict:
     return state_dict
 
 
+def load_fsdp_state_dict(module: nn.Module, state_dict: dict, *, strict: bool = True):
+    """Load a rank-complete state dict into FSDP or a regular module."""
+    if not isinstance(module, FSDP):
+        return module.load_state_dict(state_dict, strict=strict)
+
+    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+    load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+    with FSDP.state_dict_type(module, StateDictType.FULL_STATE_DICT, load_policy):
+        return module.load_state_dict(state_dict, strict=strict)
+
+
+def refresh_fp8_training_scales(module: nn.Module) -> None:
+    """Refresh torchao FP8 weight scales after an optimizer update."""
+    from ltx_core.model.transformer import precompute_fsdp_fp8_scales
+
+    precompute_fsdp_fp8_scales(module)
+
+
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    """Read a value from an OmegaConf object, mapping, or namespace."""
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _resolve_hf_token(config: Any) -> str:
+    """Resolve a Hugging Face token without printing it."""
+    token = os.environ.get("HF_TOKEN", "").strip()
+    token_file = str(_config_get(config, "hf_upload_token_file", "") or "")
+    if not token and token_file and os.path.isfile(token_file):
+        with open(token_file, "r", encoding="utf-8") as handle:
+            token = handle.read().strip()
+    if not token:
+        try:
+            from huggingface_hub import get_token
+
+            token = (get_token() or "").strip()
+        except Exception:
+            token = ""
+    return token
+
+
+def resolve_wandb_api_key(config: Any) -> str:
+    """Resolve a WandB API key from config, environment, or local login."""
+    api_key = str(_config_get(config, "wandb_api_key", "") or "").strip()
+    token_file = str(_config_get(config, "wandb_api_key_file", "") or "")
+    if not api_key:
+        api_key = os.environ.get("WANDB_API_KEY", "").strip()
+    if not api_key and token_file and os.path.isfile(token_file):
+        with open(token_file, "r", encoding="utf-8") as handle:
+            api_key = handle.read().strip()
+    if not api_key:
+        try:
+            import wandb
+
+            api_key = (wandb.api.api_key or "").strip()
+        except Exception:
+            api_key = ""
+    return api_key
+
+
+def validate_artifact_upload_config(config: Any) -> None:
+    """Fail before model loading when required artifact publishing cannot run."""
+    if (
+        bool(_config_get(config, "hf_upload_required", False))
+        and not bool(_config_get(config, "no_save", False))
+    ):
+        if not str(_config_get(config, "hf_upload_repo_id", "") or "").strip():
+            raise RuntimeError("Required Hugging Face repository is not configured")
+        if not bool(_config_get(config, "hf_upload_blocking", False)):
+            raise RuntimeError("Required Hugging Face uploads must be blocking")
+        if not _resolve_hf_token(config):
+            raise RuntimeError(
+                "Required Hugging Face upload has no token. Set HF_TOKEN, "
+                "hf_upload_token_file, or run `huggingface-cli login`."
+            )
+
+    if (
+        bool(_config_get(config, "wandb_video_required", False))
+        and not bool(_config_get(config, "no_visualize", False))
+    ):
+        wandb_mode = os.environ.get("WANDB_MODE", "online").strip().lower()
+        if wandb_mode == "disabled":
+            raise RuntimeError(
+                "wandb_video_required=true is incompatible with WANDB_MODE=disabled"
+            )
+        if wandb_mode not in {"offline", "dryrun"} and not resolve_wandb_api_key(config):
+            raise RuntimeError(
+                "Required WandB video logging has no API key. Set WANDB_API_KEY, "
+                "wandb_api_key_file, or run `wandb login`."
+            )
+
+
+def upload_checkpoint_to_hf(
+    checkpoint_dir: str,
+    config: Any,
+    output_path: Optional[str] = None,
+    *,
+    path_prefix: Optional[str] = None,
+    api_factory: Any = None,
+) -> bool:
+    """Upload a completed checkpoint directory according to training config.
+
+    Required uploads are synchronous and raise on any configuration, token, or
+    network failure. Optional non-blocking uploads run in a detached process so
+    training does not wait for the transfer.
+    """
+    repo_id = str(_config_get(config, "hf_upload_repo_id", "") or "").strip()
+    required = bool(_config_get(config, "hf_upload_required", False))
+    if not repo_id:
+        if required:
+            raise RuntimeError("Required Hugging Face repository is not configured")
+        return False
+
+    checkpoint_exists = os.path.isdir(checkpoint_dir)
+    if checkpoint_exists:
+        with os.scandir(checkpoint_dir) as entries:
+            checkpoint_exists = any(entries)
+    if not checkpoint_exists:
+        message = f"Checkpoint directory is missing or empty: {checkpoint_dir}"
+        if required:
+            raise RuntimeError(message)
+        print(f"[HF_UPLOAD] skipped: {message}", flush=True)
+        return False
+
+    token = _resolve_hf_token(config)
+    if not token:
+        if required:
+            raise RuntimeError(
+                "Required Hugging Face upload has no token. Set HF_TOKEN, "
+                "hf_upload_token_file, or run `huggingface-cli login`."
+            )
+        print("[HF_UPLOAD] skipped: no Hugging Face token is available", flush=True)
+        return False
+
+    configured_prefix = str(_config_get(config, "hf_upload_path_prefix", "") or "")
+    selected_prefix = configured_prefix if path_prefix is None else str(path_prefix)
+    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_dir))
+    path_in_repo = (
+        f"{selected_prefix.rstrip('/')}/{checkpoint_name}"
+        if selected_prefix
+        else checkpoint_name
+    )
+    repo_type = str(_config_get(config, "hf_upload_repo_type", "model"))
+    create_repo = bool(_config_get(config, "hf_upload_create_repo", True))
+    blocking = bool(_config_get(config, "hf_upload_blocking", False))
+    if required and not blocking:
+        raise RuntimeError("Required Hugging Face uploads must be blocking")
+
+    commit_message = f"Upload {checkpoint_name}"
+    try:
+        if blocking:
+            if api_factory is None:
+                from huggingface_hub import HfApi
+
+                api_factory = HfApi
+            api = api_factory(token=token)
+            print(
+                f"[HF_UPLOAD] uploading {checkpoint_dir} to "
+                f"{repo_id}/{path_in_repo}",
+                flush=True,
+            )
+            if create_repo:
+                api.create_repo(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    token=token,
+                    exist_ok=True,
+                )
+            api.upload_folder(
+                folder_path=checkpoint_dir,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                token=token,
+                commit_message=commit_message,
+            )
+            print(
+                f"[HF_UPLOAD] uploaded {checkpoint_dir} to "
+                f"{repo_id}/{path_in_repo}",
+                flush=True,
+            )
+            return True
+
+        code = r'''
+import os
+import sys
+from huggingface_hub import HfApi
+
+checkpoint_dir, repo_id, repo_type, path_in_repo, create_repo, commit_message = sys.argv[1:]
+token = os.environ["HF_TOKEN"]
+api = HfApi(token=token)
+if create_repo == "1":
+    api.create_repo(repo_id=repo_id, repo_type=repo_type, token=token, exist_ok=True)
+api.upload_folder(
+    folder_path=checkpoint_dir,
+    path_in_repo=path_in_repo,
+    repo_id=repo_id,
+    repo_type=repo_type,
+    token=token,
+    commit_message=commit_message,
+)
+print(f"[HF_UPLOAD] uploaded {checkpoint_dir} to {repo_id}/{path_in_repo}", flush=True)
+'''
+        cmd = [
+            sys.executable,
+            "-c",
+            code,
+            checkpoint_dir,
+            repo_id,
+            repo_type,
+            path_in_repo,
+            "1" if create_repo else "0",
+            commit_message,
+        ]
+        env = os.environ.copy()
+        env["HF_TOKEN"] = token
+        env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        log_dir = output_path or os.path.dirname(os.path.normpath(checkpoint_dir))
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "hf_upload.log")
+        with open(log_path, "ab", buffering=0) as log_file:
+            subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                env=env,
+                start_new_session=True,
+            )
+        print(
+            f"[HF_UPLOAD] queued {checkpoint_dir} to {repo_id}/{path_in_repo}",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        message = f"[HF_UPLOAD] failed: {type(exc).__name__}: {exc}"
+        if required:
+            raise RuntimeError(message) from exc
+        print(message, flush=True)
+        return False
+
+
+def wandb_video_from_path(
+    video_path: Optional[str],
+    *,
+    fps: int,
+    key: str,
+    required: bool = False,
+) -> Any:
+    """Validate a rendered MP4 and construct a WandB video media object."""
+    path = str(video_path or "")
+    if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        message = f"WandB video '{key}' is missing or empty: {path or '<unset>'}"
+        if required:
+            raise RuntimeError(message)
+        print(f"[WANDB_VIDEO] skipped: {message}", flush=True)
+        return None
+
+    try:
+        import wandb
+
+        media = wandb.Video(path, fps=fps, format="mp4")
+    except Exception as exc:
+        message = (
+            f"Failed to prepare WandB video '{key}' from {path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        if required:
+            raise RuntimeError(message) from exc
+        print(f"[WANDB_VIDEO] skipped: {message}", flush=True)
+        return None
+
+    print(f"[WANDB_VIDEO] prepared {key}: {path}", flush=True)
+    return media
+
+
 def init_logging_folder(config) -> Tuple[str, str]:
     """
     Initialize output and wandb folders.
@@ -197,7 +509,7 @@ def init_logging_folder(config) -> Tuple[str, str]:
     os.makedirs(wandb_folder, exist_ok=True)
 
     # Set wandb API key from config (required for multi-node without shared ~/.netrc)
-    wandb_api_key = getattr(config, "wandb_api_key", "")
+    wandb_api_key = resolve_wandb_api_key(config)
     if wandb_api_key:
         os.environ["WANDB_API_KEY"] = wandb_api_key
 
@@ -216,6 +528,14 @@ def init_logging_folder(config) -> Tuple[str, str]:
     try:
         wandb.init(**wandb_kwargs)
     except Exception as exc:
+        if (
+            bool(getattr(config, "wandb_video_required", False))
+            and not bool(getattr(config, "no_visualize", False))
+        ):
+            raise RuntimeError(
+                "Required WandB initialization failed; videos cannot be uploaded: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         # If rank 0 dies here, other ranks only report a later NCCL/TCPStore
         # failure during output_path broadcast. Fall back to disabled WandB so
         # training can proceed and the root cause remains visible on rank 0.
@@ -260,11 +580,153 @@ def prepare_for_saving(tensor: torch.Tensor, max_frames: int = 16) -> Any:
     return wandb.Video(video, fps=8, format="mp4")
 
 
+class ResumableDistributedSampler(torch.utils.data.distributed.DistributedSampler):
+    """DistributedSampler that can begin partway through its current epoch."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    def set_start_index(self, start_index: int) -> None:
+        start_index = int(start_index)
+        if not 0 <= start_index <= self.num_samples:
+            raise ValueError(
+                f"Sampler start_index must be in [0, {self.num_samples}], got {start_index}"
+            )
+        self.start_index = start_index
+
+    def __iter__(self):
+        indices = list(super().__iter__())
+        return iter(indices[self.start_index :])
+
+
+class ResumableDataIterator:
+    """Infinite DataLoader iterator with an exact epoch/batch resume cursor.
+
+    The datasets used by OmniForcing are deterministic. Reconstructing the
+    DistributedSampler epoch and skipping the already-consumed batches therefore
+    resumes at the same next sample on every rank.
+    """
+
+    FORMAT_VERSION = 1
+
+    def __init__(self, dataloader, *, seed: int):
+        if len(dataloader) <= 0:
+            raise ValueError("Cannot create a resumable iterator for an empty DataLoader")
+        self.dataloader = dataloader
+        self.seed = int(seed)
+        self.epoch = 0
+        self.batch_offset = 0
+        self._iterator = None
+
+    def __iter__(self):
+        return self
+
+    def _start_epoch(self) -> None:
+        sampler = getattr(self.dataloader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(self.epoch)
+        if hasattr(sampler, "set_start_index"):
+            sampler.set_start_index(self.batch_offset * self.dataloader.batch_size)
+
+        # Isolate DataLoader worker seeding from the model RNG and make it a
+        # deterministic function of the saved epoch.
+        generator = getattr(self.dataloader, "generator", None)
+        if generator is not None:
+            generator.manual_seed(self.seed + self.epoch)
+        self._iterator = iter(self.dataloader)
+
+    def __next__(self):
+        while True:
+            if self._iterator is None:
+                self._start_epoch()
+            try:
+                batch = next(self._iterator)
+            except StopIteration:
+                self.epoch += 1
+                self.batch_offset = 0
+                self._iterator = None
+                continue
+            self.batch_offset += 1
+            return batch
+
+    def state_dict(self) -> dict:
+        epoch = self.epoch
+        batch_offset = self.batch_offset
+        batches_per_epoch = len(self.dataloader)
+        if batch_offset == batches_per_epoch:
+            epoch += 1
+            batch_offset = 0
+
+        sampler = getattr(self.dataloader, "sampler", None)
+        return {
+            "format_version": self.FORMAT_VERSION,
+            "epoch": epoch,
+            "batch_offset": batch_offset,
+            "batches_per_epoch": batches_per_epoch,
+            "dataset_size": len(self.dataloader.dataset),
+            "batch_size": self.dataloader.batch_size,
+            "drop_last": self.dataloader.drop_last,
+            "sampler_class": type(sampler).__name__,
+            "sampler_seed": getattr(sampler, "seed", None),
+            "sampler_rank": getattr(sampler, "rank", None),
+            "sampler_num_replicas": getattr(sampler, "num_replicas", None),
+            "iterator_seed": self.seed,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if int(state.get("format_version", 0)) != self.FORMAT_VERSION:
+            raise RuntimeError(
+                f"Unsupported data iterator state format: {state.get('format_version')}"
+            )
+
+        current = self.state_dict()
+        immutable_keys = (
+            "batches_per_epoch",
+            "dataset_size",
+            "batch_size",
+            "drop_last",
+            "sampler_class",
+            "sampler_seed",
+            "sampler_rank",
+            "sampler_num_replicas",
+            "iterator_seed",
+        )
+        mismatches = {
+            key: (state.get(key), current.get(key))
+            for key in immutable_keys
+            if state.get(key) != current.get(key)
+        }
+        if mismatches:
+            raise RuntimeError(f"DataLoader changed across resume: {mismatches}")
+
+        epoch = int(state.get("epoch", -1))
+        batch_offset = int(state.get("batch_offset", -1))
+        if epoch < 0 or not 0 <= batch_offset < len(self.dataloader):
+            raise RuntimeError(
+                f"Invalid data iterator cursor: epoch={epoch}, batch_offset={batch_offset}"
+            )
+
+        self.epoch = epoch
+        self.batch_offset = batch_offset
+        self._iterator = None
+        self._start_epoch()
+        sampler = getattr(self.dataloader, "sampler", None)
+        if hasattr(sampler, "set_start_index"):
+            return
+
+        self.batch_offset = 0
+        for _ in range(batch_offset):
+            try:
+                next(self._iterator)
+            except StopIteration as exc:
+                raise RuntimeError("Data iterator checkpoint cursor exceeds epoch length") from exc
+            self.batch_offset += 1
+
+
 def cycle(dataloader):
-    """Infinite dataloader iterator."""
-    while True:
-        for batch in dataloader:
-            yield batch
+    """Backward-compatible infinite iterator for callers without checkpointing."""
+    return ResumableDataIterator(dataloader, seed=0)
 
 
 class AverageMeter:

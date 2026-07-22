@@ -19,6 +19,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         heads: int,
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
 
@@ -27,6 +28,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
             heads=heads,
             dim_head=dim_head,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.ff = FeedForward(
@@ -99,6 +101,7 @@ class Embeddings1DConnector(torch.nn.Module):
         num_learnable_registers: int | None = 128,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -117,6 +120,7 @@ class Embeddings1DConnector(torch.nn.Module):
                     heads=num_attention_heads,
                     dim_head=attention_head_dim,
                     rope_type=rope_type,
+                    apply_gated_attention=apply_gated_attention,
                 )
                 for _ in range(num_layers)
             ]
@@ -131,30 +135,23 @@ class Embeddings1DConnector(torch.nn.Module):
     def _replace_padded_with_learnable_registers(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert hidden_states.shape[1] % self.num_learnable_registers == 0, (
-            f"Hidden states sequence length {hidden_states.shape[1]} must be divisible by num_learnable_registers "
-            f"{self.num_learnable_registers}."
-        )
+        batch_size, sequence_length, _ = hidden_states.shape
+        if sequence_length % self.num_learnable_registers != 0:
+            raise ValueError(
+                f"Hidden-state sequence length {sequence_length} must be divisible by "
+                f"num_learnable_registers={self.num_learnable_registers}"
+            )
 
-        num_registers_duplications = hidden_states.shape[1] // self.num_learnable_registers
-        learnable_registers = torch.tile(self.learnable_registers, (num_registers_duplications, 1))
-        attention_mask_binary = (attention_mask.squeeze(1).squeeze(1).unsqueeze(-1) >= -9000.0).int()
+        registers = self.learnable_registers.repeat(
+            sequence_length // self.num_learnable_registers,
+            1,
+        ).to(hidden_states.dtype)
+        registers = registers.unsqueeze(0).expand(batch_size, -1, -1)
+        binary_mask = attention_mask[:, 0, 0, :].unsqueeze(-1) >= 0
+        binary_mask = binary_mask.to(hidden_states.dtype)
+        hidden_states = binary_mask * hidden_states + (1 - binary_mask) * registers
 
-        non_zero_hidden_states = hidden_states[:, attention_mask_binary.squeeze().bool(), :]
-        non_zero_nums = non_zero_hidden_states.shape[1]
-        pad_length = hidden_states.shape[1] - non_zero_nums
-        adjusted_hidden_states = torch.nn.functional.pad(non_zero_hidden_states, pad=(0, 0, 0, pad_length), value=0)
-        flipped_mask = torch.flip(attention_mask_binary, dims=[1])
-        hidden_states = flipped_mask * adjusted_hidden_states + (1 - flipped_mask) * learnable_registers
-
-        attention_mask = torch.full_like(
-            attention_mask,
-            0.0,
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
-        )
-
-        return hidden_states, attention_mask
+        return hidden_states, torch.zeros_like(attention_mask)
 
     def forward(
         self,
@@ -170,16 +167,19 @@ class Embeddings1DConnector(torch.nn.Module):
             tuple[torch.Tensor, torch.Tensor]: Processed features and the corresponding (possibly modified) mask.
         """
         if hidden_states.shape[-1] != self.inner_dim:
-            if hidden_states.shape[-1] < self.inner_dim:
-                hidden_states = torch.nn.functional.pad(hidden_states, (0, self.inner_dim - hidden_states.shape[-1]))
-            else:
-                hidden_states = hidden_states[..., : self.inner_dim]
+            raise ValueError(
+                "Connector input dimension does not match the checkpoint architecture: "
+                f"got {hidden_states.shape[-1]}, expected {self.inner_dim}. "
+                "Refusing to pad or truncate LTX-2.3 text features."
+            )
 
         if self.num_learnable_registers:
+            if attention_mask is None:
+                raise ValueError("attention_mask is required when learnable registers are enabled")
             hidden_states, attention_mask = self._replace_padded_with_learnable_registers(hidden_states, attention_mask)
 
         indices_grid = torch.arange(hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device)
-        indices_grid = indices_grid[None, None, :]
+        indices_grid = indices_grid[None, None, :].expand(hidden_states.shape[0], -1, -1)
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         freqs_cis = precompute_freqs_cis(
             indices_grid=indices_grid,
@@ -221,9 +221,11 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
         )
         inner_dim = config.get(f"{prefix}connector_inner_dim")
         if inner_dim is not None and inner_dim != attention_head_dim * num_attention_heads:
-            if inner_dim % attention_head_dim != 0:
-                attention_head_dim = 64 if inner_dim % 64 == 0 else attention_head_dim
-            num_attention_heads = inner_dim // attention_head_dim
+            raise ValueError(
+                f"{prefix or 'video_'}connector metadata is inconsistent: "
+                f"inner_dim={inner_dim}, attention_head_dim={attention_head_dim}, "
+                f"num_attention_heads={num_attention_heads}"
+            )
 
         connector = Embeddings1DConnector(
             attention_head_dim=attention_head_dim,
@@ -233,5 +235,6 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
             positional_embedding_max_pos=pe_max_pos,
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
+            apply_gated_attention=config.get("connector_apply_gated_attention", False),
         )
         return connector
