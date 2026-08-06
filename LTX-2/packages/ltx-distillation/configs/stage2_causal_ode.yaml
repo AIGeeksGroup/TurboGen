@@ -57,7 +57,11 @@ num_train_timestep: 1000
 # =============================================================================
 mixed_precision: true
 gradient_checkpointing: true
+# Canonical topology. The root launcher creates a temporary four-GPU override when needed.
 expected_world_size: 8
+num_frames: 121
+video_height: 512
+video_width: 768
 batch_size: 1
 lr: 2.0e-04
 beta1: 0.9
@@ -71,7 +75,7 @@ max_steps: 1000000
 # =============================================================================
 # Data Configuration
 # =============================================================================
-data_path: ./ode_lmdb_ltx23_v4
+data_path: ./ode_lmdb
 require_ode_manifest: true
 max_pair: 1000000
 load_audio: true
