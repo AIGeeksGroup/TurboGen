@@ -1,5 +1,31 @@
 # OmniForcing Step 2 全流程运行说明
 
+## 0. 直接交给 Coding Agent 的执行要求
+
+学长可以把本文件路径交给 Agent，并附上这一句话：
+
+> 请完整阅读 /data/minghua/zzy/OmniForcing/STEP2_TRAINING_GUIDE.md，不要只给方案或命令。请按文档实际检查并更新仓库、处理旧 Step 1 数据、使用 B200 后四卡启动 Step 2，持续检查到训练进程正常运行，然后把 commit、tmux、GPU、日志和缺失项如实汇报给我。
+
+Agent 接到任务后应直接执行以下流程：
+
+1. 检查 /data/minghua/zzy/OmniForcing 的 remote、branch 和工作区，并更新到 origin/main 最新版本。工作区干净时使用 git pull --ff-only；有旧修改或冲突时按第 5 节保留旧目录后重新 clone。不得直接删除整个旧项目，也不得使用 git reset --hard 清理用户改动。
+2. 检查基础模型、Gemma、conda 环境压缩包、HF token 和 WandB key。缺失时报告准确路径和错误，不得把空文件或错误模型当成已准备完成。
+3. 不复制或信任旧的 ode_pairs/ode_lmdb，也不要提前永久删除它们。让最新版 train_step2_manual.sh 先验证；错误数据由脚本在正确 HF 数据下载并验证成功后自动移入可恢复的备份目录。
+4. 本次 B200 任务固定使用后四张物理卡，启动命令必须显式带 CUDA_VISIBLE_DEVICES=4,5,6,7。不得把仓库标准 YAML 的 expected_world_size: 8 手工改成 4；一键脚本会自动生成临时四卡运行配置。
+5. 使用第 7 节的 tmux 命令启动，不要只在前台打印一遍命令。除非学长明确要求短跑，否则不要擅自修改 max_steps、保存频率、benchmark 频率或上传配置。
+6. 持续查看 step2.log，至少确认 STEP1_VALIDATE valid、4 张指定 GPU、4 个 torchrun rank 正常加载并进入训练，且没有立即出现 traceback、CUDA OOM 或分布式报错。确认后保持 tmux 中的正式训练继续运行，不要为了“测试结束”主动停止。
+
+Agent 的首次执行报告必须包含：
+
+- 当前 git commit，以及是否与 origin/main 一致；
+- 使用的 CUDA_VISIBLE_DEVICES、进程数和 tmux session 名；
+- step1 数据校验结果，以及旧错误数据被备份到哪里；
+- step2.log 中证明训练已经正常启动的关键行；
+- WandB run 地址和本地输出目录；
+- 尚未到 500 step 时，明确写“500 step 的 HF checkpoint 和 WandB 视频尚未触发”，不得提前声称上传成功；到达 500 step 后再按第 8、9 节核验上传。
+
+注意：STEP2_PREPARE_ONLY=1 只会下载并验证数据，不会加载 Step 2 模型或启动 torchrun，因此它只能算数据预检，不能当作 Step 2 训练已经测试成功。本说明的默认目标是启动并保留正式训练，而不是运行一个结束即退出的短测试。
+
 这份说明对应项目根目录的 train_step2_manual.sh。标准配置默认使用单机 8 卡；如果运行时只检测到 4 张可见 GPU，脚本会自动回退到单机 4 卡。启动前还会自动检查、下载 step1 的 ODE 数据。
 
 ## 1. 这一步做什么
