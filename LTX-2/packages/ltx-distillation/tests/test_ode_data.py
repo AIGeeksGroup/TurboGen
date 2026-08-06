@@ -15,6 +15,53 @@ from ltx_distillation.ode.data import (
     TextDataset,
     collate_ode_batch,
 )
+from ltx_distillation.ode.generate_ode_pairs import _manifest_mismatches
+from ltx_distillation.util import artifact_path_identity, artifact_paths_match
+
+
+def test_ode_manifest_comparison_ignores_storage_paths():
+    existing = {
+        "format_version": 4,
+        "producer": "producer",
+        "teacher_checkpoint": "/tmp/checkpoints/model.safetensors",
+        "generation_config": {
+            "teacher_checkpoint": "/tmp/checkpoints/model.safetensors",
+            "gemma_path": "/tmp/checkpoints/gemma",
+            "output_dir": "/tmp/run/ode_pairs",
+            "num_frames": 121,
+        },
+    }
+    requested = {
+        "format_version": 4,
+        "producer": "producer",
+        "teacher_checkpoint": "/data/checkpoints/model.safetensors",
+        "generation_config": {
+            "teacher_checkpoint": "/data/checkpoints/model.safetensors",
+            "gemma_path": "/data/checkpoints/gemma",
+            "output_dir": "/data/run/ode_pairs",
+            "num_frames": 121,
+        },
+    }
+
+    assert _manifest_mismatches(existing, requested) == []
+
+
+def test_ode_manifest_comparison_reports_generation_changes():
+    existing = {"generation_config": {"num_frames": 121}}
+    requested = {"generation_config": {"num_frames": 97}}
+
+    assert _manifest_mismatches(existing, requested) == [
+        "generation_config.num_frames: existing=121, requested=97"
+    ]
+
+
+def test_checkpoint_identity_is_portable_but_still_checks_filename():
+    scratch = "/tmp/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
+    shared = "/data/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
+
+    assert artifact_path_identity(scratch) == "ltx-2.3-22b-dev-fp8.safetensors"
+    assert artifact_paths_match(scratch, shared)
+    assert not artifact_paths_match(scratch, "/data/checkpoints/different.safetensors")
 
 
 class TestTextDataset:

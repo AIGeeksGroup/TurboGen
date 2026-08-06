@@ -40,6 +40,18 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def artifact_path_identity(path: Any) -> str:
+    """Return a storage-location-independent identity for a model artifact."""
+    value = str(path or "").strip()
+    return os.path.basename(os.path.normpath(value)) if value else ""
+
+
+def artifact_paths_match(first: Any, second: Any) -> bool:
+    """Compare artifact paths after removing machine-specific directories."""
+    first_identity = artifact_path_identity(first)
+    return bool(first_identity) and first_identity == artifact_path_identity(second)
+
+
 def capture_rng_state(device: Optional[torch.device] = None) -> dict:
     """Capture every RNG used by the training code on the current rank."""
     state = {

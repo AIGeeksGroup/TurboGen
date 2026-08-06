@@ -56,6 +56,7 @@ from ltx_distillation.util import (
     validate_artifact_upload_config,
     resolve_wandb_api_key,
     wandb_video_from_path,
+    artifact_paths_match,
 )
 
 
@@ -376,11 +377,9 @@ class ODETrainer:
                     f"Unsupported ODE dataset producer in {config.data_path}: "
                     f"{dataset.manifest.get('producer')}"
                 )
-            teacher_checkpoint = os.path.realpath(
-                dataset.manifest.get("teacher_checkpoint", "")
-            )
-            expected_checkpoint = os.path.realpath(str(config.checkpoint_path))
-            if teacher_checkpoint != expected_checkpoint:
+            teacher_checkpoint = dataset.manifest.get("teacher_checkpoint", "")
+            expected_checkpoint = str(config.checkpoint_path)
+            if not artifact_paths_match(teacher_checkpoint, expected_checkpoint):
                 raise RuntimeError(
                     "ODE dataset teacher checkpoint does not match training checkpoint: "
                     f"{teacher_checkpoint} != {expected_checkpoint}"

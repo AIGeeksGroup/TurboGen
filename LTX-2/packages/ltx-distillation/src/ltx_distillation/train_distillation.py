@@ -35,6 +35,7 @@ from ltx_distillation.util import (
     upload_checkpoint_to_hf,
     validate_artifact_upload_config,
     wandb_video_from_path,
+    artifact_paths_match,
 )
 
 
@@ -380,11 +381,9 @@ class Trainer:
                     raise RuntimeError(
                         f"Unsupported ODE producer: {manifest.get('producer')}"
                     )
-                teacher_checkpoint = os.path.realpath(
-                    str(manifest.get("teacher_checkpoint", ""))
-                )
-                expected_checkpoint = os.path.realpath(str(config.checkpoint_path))
-                if teacher_checkpoint != expected_checkpoint:
+                teacher_checkpoint = str(manifest.get("teacher_checkpoint", ""))
+                expected_checkpoint = str(config.checkpoint_path)
+                if not artifact_paths_match(teacher_checkpoint, expected_checkpoint):
                     raise RuntimeError(
                         "ODE teacher checkpoint mismatch: "
                         f"{teacher_checkpoint} != {expected_checkpoint}"

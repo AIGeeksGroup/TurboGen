@@ -32,6 +32,7 @@ Based on CausVid's generate_ode_pairs.py, adapted for LTX-2 audio-video.
 import os
 import math
 import json
+import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from typing import Optional, Dict, List, Tuple, Any
@@ -44,6 +45,53 @@ from tqdm import tqdm
 
 ODE_FORMAT_VERSION = 4
 ODE_PRODUCER = "omniforcing-ltx23-full-architecture-v2"
+
+
+def _manifest_identity(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the portable, generation-relevant identity of an ODE manifest."""
+    identity = dict(manifest)
+    generation_config = dict(identity.get("generation_config") or {})
+
+    # Storage locations change when artifacts move between scratch and shared
+    # storage; they do not affect the generated tensors.
+    generation_config.pop("output_dir", None)
+    for key in ("teacher_checkpoint", "gemma_path"):
+        value = generation_config.get(key)
+        if value:
+            generation_config[key] = os.path.basename(os.path.normpath(value))
+    identity["generation_config"] = generation_config
+
+    teacher_checkpoint = identity.get("teacher_checkpoint")
+    if teacher_checkpoint:
+        identity["teacher_checkpoint"] = os.path.basename(
+            os.path.normpath(teacher_checkpoint)
+        )
+    return identity
+
+
+def _manifest_mismatches(
+    existing_manifest: Dict[str, Any], expected_manifest: Dict[str, Any]
+) -> List[str]:
+    """Describe semantic manifest differences after path normalization."""
+    existing = _manifest_identity(existing_manifest)
+    expected = _manifest_identity(expected_manifest)
+    mismatches = []
+
+    def compare(existing_value: Any, expected_value: Any, key: str) -> None:
+        if isinstance(existing_value, dict) and isinstance(expected_value, dict):
+            for child_key in sorted(set(existing_value) | set(expected_value)):
+                compare(
+                    existing_value.get(child_key),
+                    expected_value.get(child_key),
+                    f"{key}.{child_key}" if key else child_key,
+                )
+        elif existing_value != expected_value:
+            mismatches.append(
+                f"{key}: existing={existing_value!r}, requested={expected_value!r}"
+            )
+
+    compare(existing, expected, "")
+    return mismatches
 
 
 # ---------------------------------------------------------------------------
@@ -521,9 +569,11 @@ class LTX2ODEPairGenerator(nn.Module):
                 if os.path.exists(manifest_path):
                     with open(manifest_path, "r", encoding="utf-8") as handle:
                         existing_manifest = json.load(handle)
-                    if existing_manifest != manifest:
+                    mismatches = _manifest_mismatches(existing_manifest, manifest)
+                    if mismatches:
                         raise RuntimeError(
-                            f"ODE output manifest mismatch in {output_dir}; use a new directory"
+                            f"ODE output manifest mismatch in {output_dir}; "
+                            f"use a new directory. Differences: {'; '.join(mismatches)}"
                         )
                 else:
                     existing_pairs = [name for name in os.listdir(output_dir) if name.endswith(".pt")]
@@ -593,6 +643,7 @@ class LTX2ODEPairGenerator(nn.Module):
                 message = f"prompt {prompt_idx}: {type(e).__name__}: {e}"
                 errors.append(message)
                 print(f"[rank {rank}] Error generating {message}", flush=True)
+                traceback.print_exc()
 
         # Wait for all ranks before printing summary
         if dist.is_initialized():
