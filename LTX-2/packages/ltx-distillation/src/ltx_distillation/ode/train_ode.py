@@ -69,21 +69,24 @@ def launch_distributed_job():
     timeout_minutes = int(os.environ.get("DIST_TIMEOUT_MINUTES", "120"))
     if 'RANK' in os.environ:
         # Launched via torchrun
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(
             backend='nccl',
             timeout=timedelta(minutes=timeout_minutes),
+            device_id=local_rank,
         )
-        torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     elif torch.cuda.is_available():
         # Single GPU fallback
+        torch.cuda.set_device(0)
         dist.init_process_group(
             backend='nccl',
             init_method='tcp://localhost:29500',
             world_size=1,
             rank=0,
             timeout=timedelta(minutes=timeout_minutes),
+            device_id=0,
         )
-        torch.cuda.set_device(0)
     else:
         raise RuntimeError("CUDA is required for training")
 
@@ -115,12 +118,19 @@ def init_logging_folder(config: DictConfig):
 
     # Initialize wandb
     wandb_entity = config.get("wandb_entity", None) or None
+    wandb_init_timeout = int(
+        os.environ.get(
+            "WANDB_INIT_TIMEOUT",
+            config.get("wandb_init_timeout", 300),
+        )
+    )
     wandb.init(
         project=config.get("wandb_project", "OmniForcing"),
         entity=wandb_entity,
         name=config.get("wandb_name", "ltx2_causal_ode"),
         dir=wandb_folder,
         config=OmegaConf.to_container(config),
+        settings=wandb.Settings(init_timeout=wandb_init_timeout),
     )
 
     # Save config

@@ -109,6 +109,7 @@ benchmark_clear_cuda_cache_per_round: true
 wandb_project: OmniForcing
 wandb_entity: OmniForcing1
 wandb_name: stage2_causal_ode
+wandb_init_timeout: 300
 wandb_api_key: ""
 wandb_api_key_file: ../../../.wandb_key
 wandb_video_required: true
