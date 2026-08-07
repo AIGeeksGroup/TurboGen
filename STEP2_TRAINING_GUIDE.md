@@ -17,6 +17,22 @@ This execution contract takes precedence over older four-GPU examples later in
 this document. Use the following persistent launcher for the default 8-GPU
 run; use a four-GPU command only when eight GPUs are not available.
 
+Before running any training command, always update the code to the latest
+remote `main` branch. Do not start Step 2 from an old checkout:
+
+```bash
+cd /data/minghua/zzy/OmniForcing
+git fetch origin main
+git status --short
+git pull --ff-only origin main
+git log -1 --oneline
+```
+
+The final commit must contain the current Step 2 launcher, configuration,
+training code, and this guide. If `git pull --ff-only` refuses because tracked
+files have local changes, do not use `git reset --hard`; report the changed
+files to the owner and follow Section 5 to preserve the old checkout.
+
 ```bash
 tmux new-session -d -s omniforcing-step2 \
   'cd /path/to/OmniTurbo && CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash ./train_step2_manual.sh 2>&1 | tee ./step2.log'
@@ -109,6 +125,34 @@ step1 已经生成并上传了 ODE 数据，不需要重新生成，也不涉及
 - 从 aaachier/OmniForcing-backup/ode_lmdb/ 下载训练用 LMDB；
 - 以 LTX-2.3 FP8 基础模型为初始化，读取 Gemma 文本编码器；
 - 使用 8 张或 4 张 GPU 训练 causal/autoregressive generator。
+
+## 1.1 本次 H20 报错的原因
+
+本次 H20 日志中，8 个分布式 rank 都已经启动并绑定到 GPU 0--7。日志里的
+NCCL `using GPU ... as device ... is currently unknown` 是初始化 warning，
+不是导致任务退出的错误。
+
+真正导致任务退出的是 rank 0 初始化 WandB 时的网络等待超时：
+
+~~~text
+wandb.errors.errors.CommError:
+Run initialization has timed out after 90.0 sec
+~~~
+
+也就是说，训练还没有进入第一个训练 step，也没有执行到 500 step 的保存、
+HF 上传或视频推理；HPC 节点连接 WandB 超过默认 90 秒后，rank 0 抛出异常，
+其余分布式进程随之退出。这不是 Step 1 的 `ode_lmdb` 校验错误，也不是
+GPU 数量错误。
+
+当前代码已将 WandB 初始化超时提高到 300 秒，配置字段是：
+
+~~~yaml
+wandb_init_timeout: 300
+~~~
+
+如果节点网络仍然较慢，启动前可以设置 `WANDB_INIT_TIMEOUT=600`。不能把
+`WANDB_MODE` 改成 `offline` 来绕过问题，因为本流程要求在线记录 WandB
+训练视频和 benchmark 视频。
 
 仓库中的标准配置保持 expected_world_size: 8。脚本检测到 8 张可见 GPU 时直接使用标准配置；检测到 4 张时，会用 OmegaConf 在 /tmp 生成一份临时运行配置，只把 expected_world_size 改成 4，训练结束后自动清理，标准 YAML 不会被改写。除 4 卡和 8 卡外的数量会直接报错。
 
