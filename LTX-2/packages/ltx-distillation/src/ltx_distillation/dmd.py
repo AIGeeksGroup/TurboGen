@@ -333,7 +333,12 @@ class LTX2DMD(nn.Module):
                 checkpoint_state_cache[checkpoint_path] = loaded
                 return loaded
 
-            loaded = torch.load(checkpoint_path, map_location="cpu")
+            loaded = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
             if isinstance(loaded, dict) and "generator" in loaded:
                 loaded = loaded["generator"]
             elif isinstance(loaded, dict) and "model" in loaded:
@@ -576,15 +581,20 @@ class LTX2DMD(nn.Module):
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
 
-        # Checkpoint loading with priority:
-        #   resume_checkpoint > generator_ckpt > stage1_ckpt_path
+        # The complete training-state resume is handled after model construction.
+        # For model initialization, generator_ckpt takes precedence over stage1_ckpt_path.
         if wrap_during_init:
             generator_ckpt = None
             stage1_ckpt = None
 
         if generator_ckpt:
             print(f"Loading pretrained generator from {generator_ckpt}")
-            ckpt = torch.load(generator_ckpt, map_location="cpu")
+            ckpt = torch.load(
+                generator_ckpt,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
             gen_sd = ckpt.get("generator", ckpt)
             if self.generator_use_causal_wrapper:
                 gen_sd = _remap_state_dict_keys(gen_sd)
@@ -602,7 +612,12 @@ class LTX2DMD(nn.Module):
 
         elif stage1_ckpt:
             print(f"[Stage2] Loading Stage 1 checkpoint from {stage1_ckpt}")
-            ckpt = torch.load(stage1_ckpt, map_location="cpu")
+            ckpt = torch.load(
+                stage1_ckpt,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
 
             gen_sd = ckpt.get("generator", ckpt)
             # Stage 3 configs may point stage1_ckpt_path at either:

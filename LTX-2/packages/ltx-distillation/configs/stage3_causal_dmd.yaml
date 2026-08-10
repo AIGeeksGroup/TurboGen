@@ -18,7 +18,9 @@ gemma_path: ../../../checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
 training_stage: stage3_causal_dmd
 
 # =============================================================================
-# Checkpoint Loading (Priority: resume_checkpoint > stage1_ckpt_path > generator_ckpt)
+# Checkpoint Loading:
+# - resume_checkpoint restores a complete Stage-3 training state.
+# - During model initialization, generator_ckpt takes precedence over stage1_ckpt_path.
 # =============================================================================
 resume_checkpoint: null
 # Stage 2 ODE-initialized causal model (used as generator init)
@@ -166,7 +168,7 @@ ema_start_step: 200
 # Data Configuration
 # =============================================================================
 # Path to ODE LMDB dataset (same as Stage 2)
-data_path: ./ode_lmdb_ltx23_v4
+data_path: ./ode_lmdb
 require_ode_manifest: true
 benchmark_prompt_file: ./prompts/benchmark_8.txt
 

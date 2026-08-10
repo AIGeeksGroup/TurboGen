@@ -285,6 +285,24 @@ def test_training_configs_publish_every_500_steps(
     assert config.training_stage == expected_stage
     assert config.resume_checkpoint is None
 
+    if expected_stage == "stage2_causal_ode":
+        assert config.expected_world_size == 4
+        assert config.visualize_iters == 500
+        assert config.num_frames == 121
+        assert config.video_height == 512
+        assert config.video_width == 768
+
+
+def test_manual_step2_entrypoint_is_four_gpu_and_validates_hf_ode_data():
+    project_root = Path(__file__).parents[4]
+    script = (project_root / "train_step2_manual.sh").read_text(encoding="utf-8")
+
+    assert 'NUM_GPUS="${NUM_GPUS:-4}"' in script
+    assert "export NPROC_PER_NODE=4" in script
+    assert 'allow_patterns=["ode_pairs/*", "ode_lmdb/*"]' in script
+    assert "validate_step1_artifacts" in script
+    assert "STEP1_INVALID_BACKUP_ROOT" in script
+
 
 @pytest.mark.parametrize(
     "script_name",
