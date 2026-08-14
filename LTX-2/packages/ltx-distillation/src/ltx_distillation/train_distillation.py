@@ -175,7 +175,14 @@ class Trainer:
             with open(shared_run_path_file, "r", encoding="utf-8") as f:
                 self.output_path = f.read().strip()
 
-        self.wandb_folder = os.path.join(self.output_path, "wandb")
+        configured_wandb_path = str(
+            getattr(config, "wandb_output_path", "") or ""
+        ).strip()
+        self.wandb_folder = (
+            os.path.realpath(configured_wandb_path)
+            if configured_wandb_path
+            else os.path.join(self.output_path, "wandb")
+        )
 
         barrier()
         if self.is_main_process:

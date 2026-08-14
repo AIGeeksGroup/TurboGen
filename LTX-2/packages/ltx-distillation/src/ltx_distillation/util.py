@@ -719,7 +719,14 @@ def init_logging_folder(config) -> Tuple[str, str]:
     OmegaConf.save(config, os.path.join(output_path, "config.yaml"))
 
     # Initialize wandb
-    wandb_folder = os.path.join(output_path, "wandb")
+    configured_wandb_path = str(
+        _config_get(config, "wandb_output_path", "") or ""
+    ).strip()
+    wandb_folder = (
+        os.path.realpath(configured_wandb_path)
+        if configured_wandb_path
+        else os.path.join(output_path, "wandb")
+    )
     os.makedirs(wandb_folder, exist_ok=True)
 
     # Set wandb API key from config (required for multi-node without shared ~/.netrc)
@@ -738,6 +745,22 @@ def init_logging_folder(config) -> Tuple[str, str]:
         name=run_dir_name,
         config=dict(config),
         dir=wandb_folder,
+        settings=wandb.Settings(
+            init_timeout=int(
+                _config_get(
+                    config,
+                    "wandb_init_timeout",
+                    os.environ.get("WANDB_INIT_TIMEOUT", "600"),
+                )
+            ),
+            symlink=False,
+            disable_git=True,
+        ),
+    )
+    print(
+        f"[WandB] mode={os.environ.get('WANDB_MODE', 'online')}, "
+        f"dir={wandb_folder}",
+        flush=True,
     )
     try:
         wandb.init(**wandb_kwargs)
