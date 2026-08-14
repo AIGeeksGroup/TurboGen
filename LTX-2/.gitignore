@@ -26,11 +26,9 @@ tmp
 *.safetensors
 *.sft
 
-# Step1 ODE generation artifacts committed for reproducibility
-!packages/ltx-distillation/ode_pairs/
-!packages/ltx-distillation/ode_pairs/**
-!packages/ltx-distillation/ode_lmdb/
-!packages/ltx-distillation/ode_lmdb/**
+# Local ODE data artifacts
+packages/ltx-distillation/ode_pairs/
+packages/ltx-distillation/ode_lmdb/
 
 # Media files
 *.gif

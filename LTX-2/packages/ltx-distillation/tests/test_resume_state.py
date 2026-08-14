@@ -212,3 +212,54 @@ def test_dmd_checkpoint_restores_complete_training_state(tmp_path, monkeypatch):
     assert random.random() == expected_random[0]
     assert np.random.rand() == expected_random[1]
     assert torch.equal(torch.rand(2), expected_random[2])
+
+
+def test_dmd_resume_signature_allows_relocated_absolute_paths():
+    import ltx_distillation.train_distillation as training
+
+    saved_signature = {
+        "base_checkpoint": (
+            "/raid/mc1max/zeyu/omniforcing/OmniTurbo/checkpoints/"
+            "LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors"
+        ),
+        "data_path": (
+            "/raid/mc1max/zeyu/omniforcing/OmniTurbo/LTX-2/"
+            "packages/ltx-distillation/ode_lmdb"
+        ),
+        "training_stage": "stage3_causal_dmd",
+    }
+    current_signature = {
+        "base_checkpoint": (
+            "/data/minghua/zzy/OmniForcing/checkpoints/"
+            "LTX-2.3-fp8/ltx-2.3-22b-dev-fp8.safetensors"
+        ),
+        "data_path": (
+            "/data/minghua/zzy/OmniForcing/LTX-2/packages/"
+            "ltx-distillation/ode_lmdb"
+        ),
+        "training_stage": "stage3_causal_dmd",
+    }
+
+    assert training.Trainer._resume_signature_mismatches(
+        saved_signature, current_signature
+    ) == {}
+
+
+def test_dmd_resume_signature_still_rejects_real_config_changes():
+    import ltx_distillation.train_distillation as training
+
+    mismatches = training.Trainer._resume_signature_mismatches(
+        {
+            "base_checkpoint": "/old/path/model.safetensors",
+            "data_path": "/old/path/ode_lmdb",
+            "generator_lr": 2e-5,
+        },
+        {
+            "base_checkpoint": "/new/path/model.safetensors",
+            "data_path": "/new/path/ode_lmdb",
+            "generator_lr": 1e-5,
+        },
+    )
+
+    assert mismatches == {"generator_lr": (2e-5, 1e-5)}
+

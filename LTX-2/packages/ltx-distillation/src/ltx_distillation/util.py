@@ -7,10 +7,12 @@ Includes:
 - Logging and checkpointing helpers
 """
 
+import json
 import os
 import random
 import subprocess
 import sys
+import time
 from typing import Optional, Tuple, Any
 from datetime import datetime, timedelta
 from functools import partial
@@ -303,6 +305,206 @@ def validate_artifact_upload_config(config: Any) -> None:
                 "Required WandB video logging has no API key. Set WANDB_API_KEY, "
                 "wandb_api_key_file, or run `wandb login`."
             )
+
+
+def persist_checkpoint_to_split_storage(
+    checkpoint_dir: str,
+    config: Any,
+) -> Optional[str]:
+    """Persist a local checkpoint on storage with a practical per-file limit."""
+    backup_root = str(
+        _config_get(config, "split_checkpoint_backup_root", "") or ""
+    ).strip()
+    required = bool(_config_get(config, "split_checkpoint_required", False))
+    if not backup_root:
+        if required:
+            raise RuntimeError("Required split checkpoint backup root is not configured")
+        return None
+
+    checkpoint_dir = os.path.realpath(checkpoint_dir)
+    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_dir))
+    destination_dir = os.path.join(os.path.realpath(backup_root), checkpoint_name)
+    success_path = os.path.join(destination_dir, "_SUCCESS")
+    part_size = int(
+        _config_get(config, "split_checkpoint_part_size", 16 * 1024**3)
+    )
+    visibility_timeout = int(
+        _config_get(config, "split_checkpoint_visibility_timeout", 1800)
+    )
+    if part_size <= 0:
+        raise RuntimeError(f"split_checkpoint_part_size must be positive: {part_size}")
+
+    model_path = os.path.join(checkpoint_dir, "model.pt")
+    trainer_state_path = os.path.join(checkpoint_dir, "trainer_state.json")
+    if not os.path.isfile(model_path) or os.path.getsize(model_path) <= 0:
+        raise RuntimeError(f"Local checkpoint model is missing or empty: {model_path}")
+    if not os.path.isfile(trainer_state_path) or os.path.getsize(trainer_state_path) <= 0:
+        raise RuntimeError(
+            f"Local checkpoint trainer state is missing or empty: {trainer_state_path}"
+        )
+
+    with open(trainer_state_path, "r", encoding="utf-8") as handle:
+        trainer_state = json.load(handle)
+    world_size = int(trainer_state.get("world_size", 0))
+    if world_size <= 0:
+        raise RuntimeError(f"Invalid checkpoint world_size: {world_size}")
+    checkpoint_step = int(trainer_state.get("step", -1))
+    if checkpoint_step < 0:
+        raise RuntimeError(f"Invalid checkpoint step: {checkpoint_step}")
+    model_size = os.path.getsize(model_path)
+    rank_pattern = str(
+        trainer_state.get("rank_state_pattern")
+        or "trainer_state_rank_{rank:05d}.pt"
+    )
+    rank_files = []
+    for rank in range(world_size):
+        name = rank_pattern.format(rank=rank)
+        path = os.path.join(checkpoint_dir, name)
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(f"Local checkpoint rank state is missing or empty: {path}")
+        rank_files.append((name, path, os.path.getsize(path)))
+
+    def wait_for_size(path: str, expected_size: int) -> None:
+        deadline = time.monotonic() + visibility_timeout
+        last_size = -1
+        while time.monotonic() < deadline:
+            try:
+                last_size = os.path.getsize(path)
+            except OSError:
+                last_size = -1
+            if last_size == expected_size:
+                return
+            time.sleep(5)
+        raise RuntimeError(
+            f"Shared checkpoint file did not become visible with the expected size: "
+            f"{path}, actual={last_size}, expected={expected_size}"
+        )
+
+    def write_exact(source, target_path: str, expected_size: int) -> None:
+        if os.path.isfile(target_path) and os.path.getsize(target_path) == expected_size:
+            source.seek(expected_size, os.SEEK_CUR)
+            return
+
+        copied = 0
+        with open(target_path, "wb", buffering=0) as target:
+            while copied < expected_size:
+                chunk = source.read(min(64 * 1024**2, expected_size - copied))
+                if not chunk:
+                    raise RuntimeError(
+                        f"Unexpected EOF while writing split checkpoint file: {target_path}"
+                    )
+                view = memoryview(chunk)
+                while view:
+                    written = target.write(view)
+                    if not written:
+                        raise RuntimeError(f"Short write while creating {target_path}")
+                    view = view[written:]
+                copied += len(chunk)
+            os.fsync(target.fileno())
+
+        wait_for_size(target_path, expected_size)
+
+    def copy_file(source_path: str, target_path: str, expected_size: int) -> None:
+        with open(source_path, "rb", buffering=0) as source:
+            write_exact(source, target_path, expected_size)
+
+    expected_success = {
+        "format_version": 1,
+        "checkpoint": checkpoint_name,
+        "step": checkpoint_step,
+        "model_size": model_size,
+        "world_size": world_size,
+    }
+    if os.path.isfile(success_path) and os.path.getsize(success_path) > 0:
+        with open(success_path, "r", encoding="utf-8") as handle:
+            existing_success = json.load(handle)
+        if all(existing_success.get(key) == value for key, value in expected_success.items()):
+            print(
+                f"[SPLIT_BACKUP] reusing completed checkpoint: {destination_dir}",
+                flush=True,
+            )
+            return destination_dir
+        raise RuntimeError(
+            f"Split checkpoint success marker does not match local checkpoint: "
+            f"{success_path}"
+        )
+
+    os.makedirs(destination_dir, exist_ok=True)
+    parts = []
+    with open(model_path, "rb", buffering=0) as source:
+        offset = 0
+        index = 0
+        while offset < model_size:
+            current_size = min(part_size, model_size - offset)
+            name = f"model.pt.part-{index:05d}"
+            target_path = os.path.join(destination_dir, name)
+            print(
+                f"[SPLIT_BACKUP] writing {checkpoint_name}/{name} "
+                f"({current_size} bytes)",
+                flush=True,
+            )
+            write_exact(source, target_path, current_size)
+            parts.append({"name": name, "size": current_size})
+            offset += current_size
+            index += 1
+
+    copy_file(
+        trainer_state_path,
+        os.path.join(destination_dir, "trainer_state.json"),
+        os.path.getsize(trainer_state_path),
+    )
+    for name, source_path, size in rank_files:
+        print(
+            f"[SPLIT_BACKUP] writing {checkpoint_name}/{name} ({size} bytes)",
+            flush=True,
+        )
+        copy_file(source_path, os.path.join(destination_dir, name), size)
+
+    parts_manifest = {
+        "format_version": 1,
+        "original_filename": "model.pt",
+        "original_size": model_size,
+        "part_size": part_size,
+        "parts": parts,
+    }
+    parts_manifest_path = os.path.join(destination_dir, "model.pt.parts.json")
+    parts_manifest_bytes = (
+        json.dumps(parts_manifest, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    with open(parts_manifest_path, "wb", buffering=0) as handle:
+        handle.write(parts_manifest_bytes)
+        os.fsync(handle.fileno())
+    wait_for_size(parts_manifest_path, len(parts_manifest_bytes))
+
+    for item in parts:
+        wait_for_size(
+            os.path.join(destination_dir, item["name"]),
+            int(item["size"]),
+        )
+    wait_for_size(
+        os.path.join(destination_dir, "trainer_state.json"),
+        os.path.getsize(trainer_state_path),
+    )
+    for name, _, size in rank_files:
+        wait_for_size(os.path.join(destination_dir, name), size)
+    wait_for_size(
+        os.path.join(destination_dir, "model.pt.parts.json"),
+        len(parts_manifest_bytes),
+    )
+    success_payload = dict(expected_success)
+    success_payload["part_count"] = len(parts)
+    success_bytes = (json.dumps(success_payload, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    with open(success_path, "wb", buffering=0) as handle:
+        handle.write(success_bytes)
+        os.fsync(handle.fileno())
+    wait_for_size(success_path, len(success_bytes))
+    print(
+        f"[SPLIT_BACKUP] persisted checkpoint to {destination_dir}",
+        flush=True,
+    )
+    return destination_dir
 
 
 def upload_checkpoint_to_hf(

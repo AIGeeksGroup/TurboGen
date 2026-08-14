@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import time
 from typing import Optional, Tuple
 
@@ -32,6 +33,7 @@ from ltx_distillation.util import (
     ResumableDistributedSampler,
     capture_rng_state,
     restore_rng_state,
+    persist_checkpoint_to_split_storage,
     upload_checkpoint_to_hf,
     validate_artifact_upload_config,
     wandb_video_from_path,
@@ -561,6 +563,34 @@ class Trainer:
         }
 
     @staticmethod
+    def _resume_path_signature_matches(saved_path, current_path) -> bool:
+        if saved_path == current_path:
+            return True
+        if not saved_path or not current_path:
+            return False
+        saved_name = os.path.basename(os.path.normpath(str(saved_path)))
+        current_name = os.path.basename(os.path.normpath(str(current_path)))
+        return bool(saved_name and saved_name == current_name)
+
+    @classmethod
+    def _resume_signature_mismatches(cls, saved_signature, current_signature) -> dict:
+        saved_signature = saved_signature or {}
+        current_signature = current_signature or {}
+        path_keys = {"base_checkpoint", "data_path"}
+        mismatches = {}
+        for key in sorted(set(saved_signature) | set(current_signature)):
+            saved_value = saved_signature.get(key)
+            current_value = current_signature.get(key)
+            if saved_value == current_value:
+                continue
+            if key in path_keys and cls._resume_path_signature_matches(
+                saved_value, current_value
+            ):
+                continue
+            mismatches[key] = (saved_value, current_value)
+        return mismatches
+
+    @staticmethod
     def _load_scheduler_state(scheduler, state, name: str) -> None:
         if scheduler is None and state is None:
             return
@@ -598,13 +628,8 @@ class Trainer:
 
         saved_signature = manifest.get("resume_signature")
         current_signature = self._resume_signature()
-        if saved_signature != current_signature:
-            keys = sorted(set(saved_signature or {}) | set(current_signature))
-            mismatches = {
-                key: ((saved_signature or {}).get(key), current_signature.get(key))
-                for key in keys
-                if (saved_signature or {}).get(key) != current_signature.get(key)
-            }
+        mismatches = self._resume_signature_mismatches(saved_signature, current_signature)
+        if mismatches:
             raise RuntimeError(f"Training configuration changed across resume: {mismatches}")
 
         rank_state_path = os.path.join(
@@ -687,6 +712,28 @@ class Trainer:
                 f"Resume max_steps must be greater than saved step {self.step}, got {max_steps}."
             )
         del rank_state
+        barrier()
+        if (
+            self.is_main_process
+            and os.environ.get("STEP3_DELETE_MATERIALIZED_RESUME", "0") == "1"
+        ):
+            marker_path = os.path.join(
+                checkpoint_dir,
+                "model.pt.assembled.json",
+            )
+            try:
+                os.remove(checkpoint_path)
+                print(
+                    f"[Resume] Removed materialized local model after restore: "
+                    f"{checkpoint_path}",
+                    flush=True,
+                )
+            except FileNotFoundError:
+                pass
+            try:
+                os.remove(marker_path)
+            except FileNotFoundError:
+                pass
         barrier()
         if self.is_main_process:
             print(
@@ -779,11 +826,30 @@ class Trainer:
                 handle.write("\n")
             os.replace(manifest_tmp, manifest_path)
             print(f"Checkpoint saved to {save_path}")
+            split_backup_path = persist_checkpoint_to_split_storage(
+                checkpoint_dir,
+                self.config,
+            )
             upload_checkpoint_to_hf(
                 checkpoint_dir,
                 self.config,
                 output_path=self.output_path,
             )
+            if (
+                split_backup_path
+                and bool(
+                    self.config.get(
+                        "delete_local_checkpoint_after_split_backup",
+                        False,
+                    )
+                )
+            ):
+                shutil.rmtree(checkpoint_dir)
+                print(
+                    f"Removed local checkpoint after split backup and upload: "
+                    f"{checkpoint_dir}",
+                    flush=True,
+                )
 
         barrier()
         del generator_state_dict, critic_state_dict
