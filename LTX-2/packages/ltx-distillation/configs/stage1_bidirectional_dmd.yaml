@@ -110,6 +110,7 @@ save_iters: 500
 wandb_project: OmniForcing
 wandb_entity: OmniForcing1
 wandb_name: stage1_bidirectional_dmd
+wandb_init_timeout: 300
 # wandb_api_key: "your-wandb-api-key"
 wandb_api_key_file: ../../../.wandb_key
 wandb_video_required: true

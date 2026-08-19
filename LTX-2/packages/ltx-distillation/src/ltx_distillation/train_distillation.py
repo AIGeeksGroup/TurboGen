@@ -741,6 +741,12 @@ class Trainer:
                 os.remove(marker_path)
             except FileNotFoundError:
                 pass
+        elif self.is_main_process:
+            print(
+                f"[Resume] Keeping materialized local model for HPC requeue: "
+                f"{checkpoint_path}",
+                flush=True,
+            )
         barrier()
         if self.is_main_process:
             print(
