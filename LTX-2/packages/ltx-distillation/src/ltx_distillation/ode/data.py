@@ -269,6 +269,38 @@ class TextDataset(Dataset):
         return self.texts[idx]
 
 
+class PromptDataset(Dataset):
+    """Prompt-only dataset used by on-policy Step 2 training.
+
+    Unlike the legacy LMDB dataset this class stores no teacher trajectories;
+    all latents are sampled inside the training rollout.
+    """
+
+    def __init__(self, data_path: str, max_pair: int = int(1e8)):
+        self.data_path = data_path
+        self.texts = []
+        with open(data_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if text:
+                    self.texts.append(text)
+        self.max_pair = int(max_pair)
+
+    def __len__(self) -> int:
+        return min(len(self.texts), self.max_pair)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return {"prompts": self.texts[idx]}
+
+    def get_prompts(self, count: int) -> list[str]:
+        return self.texts[: min(int(count), len(self.texts))]
+
+
+def collate_prompt_batch(batch: list) -> Dict[str, Any]:
+    """Collate prompt-only samples without manufacturing latent tensors."""
+    return {"prompts": [sample["prompts"] for sample in batch]}
+
+
 def collate_ode_batch(batch: list) -> Dict[str, Any]:
     """
     Custom collate function for ODE regression batches.

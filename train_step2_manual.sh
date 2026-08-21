@@ -291,7 +291,38 @@ PY
     echo "Correct Step 1 artifacts are ready: $PAIR_DIR and $LMDB_DIR"
 }
 
-ensure_step1_data
+ON_POLICY_STEP2="$(python - "$CONFIG_PATH" <<'PY'
+import sys
+from omegaconf import OmegaConf
+
+config = OmegaConf.load(sys.argv[1])
+print("1" if bool(config.get("on_policy", False)) else "0")
+PY
+)"
+
+if [[ "$ON_POLICY_STEP2" == "1" ]]; then
+    PROMPT_FILE="$(python - "$CONFIG_PATH" "$DISTILLATION_ROOT" <<'PY'
+import os
+import sys
+from omegaconf import OmegaConf
+
+config = OmegaConf.load(sys.argv[1])
+prompt_path = config.get("prompt_file") or config.get("train_prompt_file") or config.get("data_path")
+if not prompt_path:
+    raise SystemExit("on_policy Step 2 config must define prompt_file")
+if not os.path.isabs(str(prompt_path)):
+    prompt_path = os.path.join(sys.argv[2], str(prompt_path))
+print(os.path.realpath(prompt_path))
+PY
+)"
+    [[ -s "$PROMPT_FILE" ]] || {
+        echo "Missing on-policy Step 2 prompt file: $PROMPT_FILE" >&2
+        exit 1
+    }
+    echo "On-policy Step 2 enabled; using prompt-only training data: $PROMPT_FILE"
+else
+    ensure_step1_data
+fi
 
 if [[ "${STEP2_PREPARE_ONLY}" == "1" ]]; then
     echo "Step 2 preparation complete; STEP2_PREPARE_ONLY=1, training was not started."
@@ -368,7 +399,11 @@ echo "Base config:   $CONFIG_PATH"
 echo "Runtime config: $TRAIN_CONFIG_PATH"
 echo "Visible GPUs:  $CUDA_VISIBLE_DEVICES"
 echo "GPU processes: $NPROC_PER_NODE"
-echo "Step 1 LMDB:   $LMDB_DIR"
+if [[ "$ON_POLICY_STEP2" == "1" ]]; then
+    echo "Prompt file:   $PROMPT_FILE"
+else
+    echo "Step 1 LMDB:   $LMDB_DIR"
+fi
 echo "WandB:         $WANDB_MODE"
 echo "HF repository: $HF_REPO_ID"
 echo "========================================================"

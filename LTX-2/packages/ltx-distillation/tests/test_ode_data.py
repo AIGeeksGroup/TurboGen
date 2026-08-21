@@ -12,8 +12,10 @@ import torch
 
 from ltx_distillation.ode.data import (
     ODERegressionDataset,
+    PromptDataset,
     TextDataset,
     collate_ode_batch,
+    collate_prompt_batch,
 )
 from ltx_distillation.ode.generate_ode_pairs import _manifest_mismatches
 from ltx_distillation.util import artifact_path_identity, artifact_paths_match
@@ -91,16 +93,34 @@ class TestTextDataset:
             f.write("First prompt\n")
             f.write("\n")
             f.write("Second prompt\n")
-            f.write("   \n")  # whitespace only
+            f.write("   \n")
             f.write("Third prompt\n")
             f.name
 
         try:
             dataset = TextDataset(f.name)
-            # Only non-empty lines should be included
             assert len(dataset) >= 3
         finally:
             os.unlink(f.name)
+
+
+class TestPromptDataset:
+    """Prompt-only input used by the on-policy Step 2 trainer."""
+
+    def test_prompt_dataset_and_collate(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as handle:
+            handle.write("first\n\nsecond\n")
+            path = handle.name
+        try:
+            dataset = PromptDataset(path)
+            assert len(dataset) == 2
+            assert dataset[0] == {"prompts": "first"}
+            batch = collate_prompt_batch([dataset[0], dataset[1]])
+            assert batch == {"prompts": ["first", "second"]}
+            assert dataset.get_prompts(1) == ["first"]
+        finally:
+            os.unlink(path)
+
 
 
 class TestODERegressionDataset:

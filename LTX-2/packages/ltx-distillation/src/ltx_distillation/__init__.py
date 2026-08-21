@@ -26,6 +26,7 @@ from ltx_distillation.ode import (
     ODERegressionConfig,
     ODERegressionLMDBDataset,
     ODERegressionDataset,
+    PromptDataset,
 )
 
 __version__ = "0.1.0"
@@ -41,4 +42,5 @@ __all__ = [
     "ODERegressionConfig",
     "ODERegressionLMDBDataset",
     "ODERegressionDataset",
+    "PromptDataset",
 ]

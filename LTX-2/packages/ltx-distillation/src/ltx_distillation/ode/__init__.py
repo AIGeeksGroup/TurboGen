@@ -26,8 +26,10 @@ from ltx_distillation.ode.generate_ode_pairs import (
 from ltx_distillation.ode.data import (
     ODERegressionLMDBDataset,
     ODERegressionDataset,
+    PromptDataset,
     TextDataset,
     collate_ode_batch,
+    collate_prompt_batch,
 )
 from ltx_distillation.ode.ode_regression import (
     LTX2ODERegression,
@@ -44,8 +46,10 @@ __all__ = [
     # Datasets
     "ODERegressionLMDBDataset",
     "ODERegressionDataset",
+    "PromptDataset",
     "TextDataset",
     "collate_ode_batch",
+    "collate_prompt_batch",
     # Training
     "LTX2ODERegression",
     "ODERegressionConfig",

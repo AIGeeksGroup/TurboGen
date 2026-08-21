@@ -242,6 +242,42 @@ class TestInputPreparation:
                 value_name="trajectory index",
             )
 
+    def test_prepare_input_excludes_clean_endpoint(self, monkeypatch):
+        regression = object.__new__(LTX2ODERegression)
+        torch.nn.Module.__init__(regression)
+        regression.config = SimpleNamespace(
+            uniform_timestep=False,
+            generator_task="bidirectional_video",
+            num_frame_per_block=3,
+            num_frame_per_block_first=4,
+        )
+        regression.device = torch.device("cpu")
+        regression.dtype = torch.float32
+        regression.denoising_step_list = torch.tensor([1000, 500, 0])
+        observed = {}
+
+        def fake_randint(low, high, size, **kwargs):
+            observed["low"] = low
+            observed["high"] = high
+            return torch.zeros(size, dtype=torch.long, **{
+                key: value for key, value in kwargs.items() if key in {"device"}
+            })
+
+        monkeypatch.setattr(torch, "randint", fake_randint)
+        trajectory = torch.randn(1, 3, 4, 2, 1, 1)
+        regression._prepare_generator_input(trajectory)
+        assert observed == {"low": 0, "high": 2}
+
+
+class TestFlowOPD:
+    def test_time_weight_matches_scheme(self):
+        sigma = torch.tensor([0.5, 0.25], dtype=torch.float32)
+        expected = (0.001 / 2) * (
+            sigma * (1 - sigma) / (2 * sigma) + 1 / sigma
+        ).pow(2)
+        actual = LTX2ODERegression._flow_opd_time_weight(sigma)
+        assert torch.allclose(actual, expected)
+
 
 class TestLossComputation:
     """Tests for ODE regression loss computation."""

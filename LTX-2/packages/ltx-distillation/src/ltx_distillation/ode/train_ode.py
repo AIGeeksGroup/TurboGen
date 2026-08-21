@@ -23,6 +23,7 @@ import argparse
 import functools
 import gc
 import socket
+from contextlib import nullcontext
 from dataclasses import asdict
 from collections import defaultdict
 from datetime import timedelta
@@ -44,7 +45,12 @@ from omegaconf import OmegaConf, DictConfig
 import wandb
 
 from ltx_distillation.inference.ode_benchmark_pipeline import ODEAutoregressiveBenchmarkPipeline
-from ltx_distillation.ode.data import ODERegressionLMDBDataset, collate_ode_batch
+from ltx_distillation.ode.data import (
+    ODERegressionLMDBDataset,
+    PromptDataset,
+    collate_ode_batch,
+    collate_prompt_batch,
+)
 from ltx_distillation.ode.ode_regression import LTX2ODERegression, ODERegressionConfig
 from ltx_distillation.util import (
     fsdp_state_dict as shared_fsdp_state_dict,
@@ -302,6 +308,13 @@ class ODETrainer:
             generator_task=config.generator_task,
             num_frame_per_block=config.get("num_frame_per_block", 3),
             num_frame_per_block_first=config.get("num_frame_per_block_first", 4),
+            num_frames=config.get("num_frames", 121),
+            num_inference_steps=config.get("num_inference_steps", 40),
+            on_policy=config.get("on_policy", False),
+            teacher_fp8_mode=config.get("teacher_fp8_mode", "static"),
+            teacher_device=config.get("teacher_device", "cpu"),
+            on_policy_teacher_prefix=config.get("on_policy_teacher_prefix", True),
+            flow_opd_delta_t=config.get("flow_opd_delta_t", 0.001),
             gradient_checkpointing=config.gradient_checkpointing,
             mixed_precision=config.mixed_precision,
             uniform_timestep=config.get("uniform_timestep", False),
@@ -346,6 +359,21 @@ class ODETrainer:
             wrap_strategy=gen_wrap_strategy,
             transformer_module=gen_transformer_module,
         )
+        if config.get("on_policy", False):
+            teacher_wrap_strategy = config.get("teacher_fsdp_wrap_strategy", "size")
+            self.ode_model._teacher = fsdp_wrap(
+                self.ode_model._teacher,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=teacher_wrap_strategy,
+            )
+            self.ode_model._teacher.requires_grad_(False)
+            self.ode_model._teacher.eval()
+            if self.is_main_process:
+                print(
+                    "[Step2] On-policy teacher wrapped with FSDP "
+                    f"(strategy={teacher_wrap_strategy}, frozen=True)"
+                )
         if config.get("text_encoder_device", "cuda") != "cpu":
             self.ode_model._text_encoder = fsdp_wrap(
                 self.ode_model._text_encoder,
@@ -365,66 +393,88 @@ class ODETrainer:
             weight_decay=config.get("weight_decay", 0.0),
         )
 
-        # Dataloader and fixed benchmark prompt source
-        dataset = ODERegressionLMDBDataset(
-            config.data_path,
-            max_pair=config.get("max_pair", int(1e8)),
-            load_audio=config.get("load_audio", True),
-        )
-        if config.get("require_ode_manifest", True):
-            if dataset.manifest is None:
-                raise RuntimeError(
-                    f"ODE dataset has no LTX-2.3 provenance manifest: {config.data_path}. "
-                    "Generate a fresh dataset instead of reusing ode_lmdb."
+        # Dataloader.  Corrected Step 2 is prompt-only: teacher trajectories
+        # are generated on-policy inside the rollout.  Keep the old LMDB
+        # branch for explicit offline ablations and checkpoint compatibility.
+        on_policy = bool(config.get("on_policy", False))
+        if on_policy:
+            prompt_path = config.get("prompt_file") or config.get("train_prompt_file")
+            if not prompt_path:
+                prompt_path = config.get("data_path")
+            if not prompt_path or not os.path.isfile(str(prompt_path)):
+                raise FileNotFoundError(
+                    "on_policy Step 2 requires a text prompt file; set prompt_file "
+                    f"(received {prompt_path!r})"
                 )
-            if dataset.manifest.get("format_version") != 4:
-                raise RuntimeError(
-                    f"Unsupported ODE dataset format in {config.data_path}: "
-                    f"{dataset.manifest.get('format_version')}"
-                )
-            if dataset.manifest.get("producer") != "omniforcing-ltx23-full-architecture-v2":
-                raise RuntimeError(
-                    f"Unsupported ODE dataset producer in {config.data_path}: "
-                    f"{dataset.manifest.get('producer')}"
-                )
-            teacher_checkpoint = dataset.manifest.get("teacher_checkpoint", "")
-            expected_checkpoint = str(config.checkpoint_path)
-            if not artifact_paths_match(teacher_checkpoint, expected_checkpoint):
-                raise RuntimeError(
-                    "ODE dataset teacher checkpoint does not match training checkpoint: "
-                    f"{teacher_checkpoint} != {expected_checkpoint}"
-                )
-            generation_config = dataset.manifest.get("generation_config")
-            if not isinstance(generation_config, dict):
-                raise RuntimeError(
-                    f"ODE dataset has no generation_config: {config.data_path}"
-                )
-            generated_steps = generation_config.get(
-                "denoising_step_list"
+            dataset = PromptDataset(
+                str(prompt_path),
+                max_pair=config.get("max_pair", int(1e8)),
             )
-            if list(generated_steps or []) != list(config.denoising_step_list):
-                raise RuntimeError(
-                    "ODE dataset denoising schedule does not match training config: "
-                    f"{generated_steps} != {list(config.denoising_step_list)}"
+            collate_fn = collate_prompt_batch
+            if self.is_main_process:
+                print(
+                    f"[Step2] On-policy prompt dataset: {prompt_path} "
+                    f"({len(dataset)} prompts; no LMDB trajectories)"
                 )
-            expected_generation_values = {
-                "video_height": int(config.get("video_height", 512)),
-                "video_width": int(config.get("video_width", 768)),
-            }
-            mismatched_generation_values = {
-                key: (generation_config.get(key), expected)
-                for key, expected in expected_generation_values.items()
-                if generation_config.get(key) != expected
-            }
-            if mismatched_generation_values:
-                raise RuntimeError(
-                    "ODE dataset geometry does not match training config: "
-                    f"{mismatched_generation_values}"
-                )
-            if not dataset.has_sigmas:
-                raise RuntimeError(
-                    f"ODE dataset has no exact scheduler sigmas: {config.data_path}"
-                )
+        else:
+            dataset = ODERegressionLMDBDataset(
+                config.data_path,
+                max_pair=config.get("max_pair", int(1e8)),
+                load_audio=config.get("load_audio", True),
+            )
+            if config.get("require_ode_manifest", True):
+                if dataset.manifest is None:
+                    raise RuntimeError(
+                        f"ODE dataset has no LTX-2.3 provenance manifest: {config.data_path}. "
+                        "Generate a fresh dataset instead of reusing ode_lmdb."
+                    )
+                if dataset.manifest.get("format_version") != 4:
+                    raise RuntimeError(
+                        f"Unsupported ODE dataset format in {config.data_path}: "
+                        f"{dataset.manifest.get('format_version')}"
+                    )
+                if dataset.manifest.get("producer") != "omniforcing-ltx23-full-architecture-v2":
+                    raise RuntimeError(
+                        f"Unsupported ODE dataset producer in {config.data_path}: "
+                        f"{dataset.manifest.get('producer')}"
+                    )
+                teacher_checkpoint = dataset.manifest.get("teacher_checkpoint", "")
+                expected_checkpoint = str(config.checkpoint_path)
+                if not artifact_paths_match(teacher_checkpoint, expected_checkpoint):
+                    raise RuntimeError(
+                        "ODE dataset teacher checkpoint does not match training checkpoint: "
+                        f"{teacher_checkpoint} != {expected_checkpoint}"
+                    )
+                generation_config = dataset.manifest.get("generation_config")
+                if not isinstance(generation_config, dict):
+                    raise RuntimeError(
+                        f"ODE dataset has no generation_config: {config.data_path}"
+                    )
+                generated_steps = generation_config.get("denoising_step_list")
+                if list(generated_steps or []) != list(config.denoising_step_list):
+                    raise RuntimeError(
+                        "ODE dataset denoising schedule does not match training config: "
+                        f"{generated_steps} != {list(config.denoising_step_list)}"
+                    )
+                expected_generation_values = {
+                    "video_height": int(config.get("video_height", 512)),
+                    "video_width": int(config.get("video_width", 768)),
+                }
+                mismatched_generation_values = {
+                    key: (generation_config.get(key), expected)
+                    for key, expected in expected_generation_values.items()
+                    if generation_config.get(key) != expected
+                }
+                if mismatched_generation_values:
+                    raise RuntimeError(
+                        "ODE dataset geometry does not match training config: "
+                        f"{mismatched_generation_values}"
+                    )
+                if not dataset.has_sigmas:
+                    raise RuntimeError(
+                        f"ODE dataset has no exact scheduler sigmas: {config.data_path}"
+                    )
+            collate_fn = collate_ode_batch
         self.dataset = dataset
 
         sampler = ResumableDistributedSampler(
@@ -436,7 +486,7 @@ class ODETrainer:
             batch_size=config.batch_size,
             sampler=sampler,
             num_workers=config.get("num_workers", 8),
-            collate_fn=collate_ode_batch,
+            collate_fn=collate_fn,
             pin_memory=True,
             generator=torch.Generator(),
         )
@@ -560,7 +610,7 @@ class ODETrainer:
         except Exception as e:
             print(f"WARNING: Failed to load VAE for {reason}: {e}")
 
-    def _init_benchmark_state(self, dataset: ODERegressionLMDBDataset) -> None:
+    def _init_benchmark_state(self, dataset) -> None:
         """Initialize fixed ODE benchmark prompts and latent shapes."""
         from ltx_core.components.schedulers import LTX2Scheduler
 
@@ -586,12 +636,28 @@ class ODETrainer:
             getattr(config, "benchmark_clear_cuda_cache_per_round", True)
         )
         self.benchmark_prompts = []
-        self.benchmark_video_shape_single = tuple([1, *dataset.video_shape[2:]])
-        self.benchmark_audio_shape_single = None
-        if getattr(dataset, "has_audio", False):
-            self.benchmark_audio_shape_single = tuple([1, *dataset.audio_shape[2:]])
+        if bool(config.get("on_policy", False)):
+            from ltx_causal.attention.mask_builder import compute_aligned_audio_frames
 
-        if getattr(dataset, "has_sigmas", False):
+            latent_frames = 1 + (int(config.get("num_frames", 121)) - 1) // 8
+            latent_height = int(config.get("video_height", 512)) // 32
+            latent_width = int(config.get("video_width", 768)) // 32
+            audio_frames = compute_aligned_audio_frames(
+                latent_frames,
+                num_frame_per_block=int(config.get("num_frame_per_block", 3)),
+                num_frame_per_block_first=int(config.get("num_frame_per_block_first", 4)),
+            )
+            self.benchmark_video_shape_single = (
+                1, latent_frames, 128, latent_height, latent_width
+            )
+            self.benchmark_audio_shape_single = (1, audio_frames, 128)
+        else:
+            self.benchmark_video_shape_single = tuple([1, *dataset.video_shape[2:]])
+            self.benchmark_audio_shape_single = None
+            if getattr(dataset, "has_audio", False):
+                self.benchmark_audio_shape_single = tuple([1, *dataset.audio_shape[2:]])
+
+        if not bool(config.get("on_policy", False)) and getattr(dataset, "has_sigmas", False):
             try:
                 # Reuse the exact sub-sampled sigma schedule stored alongside the
                 # training trajectories so benchmark sampling matches ODE training.
@@ -604,10 +670,21 @@ class ODETrainer:
                     steps=num_denoising_steps
                 ).to(self.device)
         else:
-            num_denoising_steps = max(1, len(config.denoising_step_list) - 1)
-            self.benchmark_denoising_sigmas = LTX2Scheduler().execute(
-                steps=num_denoising_steps
-            ).to(self.device)
+            if bool(config.get("on_policy", False)):
+                full_sigmas = LTX2Scheduler().execute(
+                    steps=int(config.get("num_inference_steps", 40))
+                ).to(self.device)
+                self.benchmark_denoising_sigmas = torch.stack([
+                    full_sigmas[
+                        (full_sigmas - (float(timestep) / 1000.0)).abs().argmin()
+                    ]
+                    for timestep in config.denoising_step_list
+                ])
+            else:
+                num_denoising_steps = max(1, len(config.denoising_step_list) - 1)
+                self.benchmark_denoising_sigmas = LTX2Scheduler().execute(
+                    steps=num_denoising_steps
+                ).to(self.device)
 
         if not self.benchmark_enabled:
             pass
@@ -616,7 +693,8 @@ class ODETrainer:
             print("[Benchmark] Disabled because benchmark_iters <= 0.")
             self.benchmark_enabled = False
 
-        # Load benchmark prompts: prefer benchmark_prompt_file, fallback to LMDB.
+        # Load benchmark prompts: prefer benchmark_prompt_file, fallback to the
+        # prompt-only dataset (or LMDB in the legacy branch).
         prompt_file = config.get("benchmark_prompt_file", None)
         if prompt_file and os.path.exists(prompt_file):
             with open(prompt_file, "r") as f:
@@ -626,7 +704,7 @@ class ODETrainer:
         else:
             try:
                 self.benchmark_prompts = dataset.get_prompts(self.benchmark_num_prompts)
-                prompt_source = "LMDB"
+                prompt_source = "training prompts"
             except Exception as e:
                 if self.is_main_process:
                     print(f"[Benchmark] Failed to load prompts from LMDB: {e}")
@@ -892,9 +970,20 @@ class ODETrainer:
         return {
             "training_stage": self.training_stage,
             "base_checkpoint": os.path.realpath(str(config.checkpoint_path)),
-            "data_path": os.path.realpath(str(config.data_path)),
+            "teacher_checkpoint": os.path.realpath(
+                str(config.get("bidirectional_model_checkpoint") or config.checkpoint_path)
+            ),
+            "teacher_fp8_mode": str(config.get("teacher_fp8_mode", "static")),
+            "teacher_device": str(config.get("teacher_device", "cpu")),
+            "on_policy": bool(config.get("on_policy", False)),
+            "data_path": os.path.realpath(
+                str(config.get("prompt_file") or config.get("train_prompt_file") or config.get("data_path", ""))
+            ),
+            "flow_opd_delta_t": float(config.get("flow_opd_delta_t", 0.001)),
+            "on_policy_teacher_prefix": bool(config.get("on_policy_teacher_prefix", True)),
             "generator_task": str(config.generator_task),
             "denoising_step_list": list(config.denoising_step_list),
+            "num_inference_steps": int(config.get("num_inference_steps", 40)),
             "batch_size": int(config.batch_size),
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "lr": float(config.lr),
@@ -907,7 +996,9 @@ class ODETrainer:
             "generator_fsdp_wrap_strategy": str(
                 config.get("generator_fsdp_wrap_strategy", "transformer")
             ),
-            "teacher_fp8_mode": str(config.get("teacher_fp8_mode", "")),
+            "teacher_fsdp_wrap_strategy": str(
+                config.get("teacher_fsdp_wrap_strategy", "size")
+            ),
             "trainable_fp8_mode": str(config.get("trainable_fp8_mode", "")),
             "loss_target": str(config.get("loss_target", "velocity")),
             "uniform_timestep": bool(config.get("uniform_timestep", False)),
@@ -1274,20 +1365,30 @@ class ODETrainer:
         self._block_diag.clear()
 
         # Log mask info once at step 0
-        if self.is_main_process and self.step == 0:
+        if (
+            self.is_main_process
+            and self.step == 0
+            and not bool(self.config.get("on_policy", False))
+        ):
             batch_peek = next(iter(self.dataloader))
             self._log_mask_info(batch_peek)
 
         # Get batch
         batch = next(self.data_iter)
         prompts = batch["prompts"]
-        video_latent = batch["video_latent"].to(device=self.device, dtype=self.dtype)
-        audio_latent = batch.get("audio_latent")
-        if audio_latent is not None:
-            audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
-        sigmas = batch.get("sigmas")
-        if sigmas is not None:
-            sigmas = sigmas.to(device=self.device, dtype=torch.float32)  # keep float32 for precision
+        on_policy = bool(self.config.get("on_policy", False))
+        if on_policy:
+            video_latent = None
+            audio_latent = None
+            sigmas = None
+        else:
+            video_latent = batch["video_latent"].to(device=self.device, dtype=self.dtype)
+            audio_latent = batch.get("audio_latent")
+            if audio_latent is not None:
+                audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
+            sigmas = batch.get("sigmas")
+            if sigmas is not None:
+                sigmas = sigmas.to(device=self.device, dtype=torch.float32)  # keep float32 for precision
 
         # Encode text
         with torch.no_grad():
@@ -1300,15 +1401,40 @@ class ODETrainer:
                     for key, value in conditional_dict.items()
                 }
 
+        # Gradient accumulation is handled around the rollout so on-policy
+        # sub-losses can be backpropagated immediately and freed.
+        accum_steps = self.gradient_accumulation_steps
+        is_first_micro = (self.step % accum_steps == 0)
+        is_last_micro = ((self.step + 1) % accum_steps == 0)
+        if is_first_micro:
+            self.optimizer.zero_grad()
+
         # Compute loss (request samples on visualization steps)
         visualize = self._should_visualize()
-        loss, log_dict = self.ode_model.generator_loss(
-            video_latent=video_latent,
-            conditional_dict=conditional_dict,
-            audio_latent=audio_latent,
-            sigmas=sigmas,
-            return_samples=visualize,
-        )
+        if on_policy:
+            def _backward_sub_loss(sub_loss):
+                (sub_loss / accum_steps).backward()
+
+            sync_context = (
+                nullcontext()
+                if is_last_micro or not hasattr(self.ode_model._generator, "no_sync")
+                else self.ode_model._generator.no_sync()
+            )
+            with sync_context:
+                loss, log_dict = self.ode_model.generator_loss(
+                    video_latent=None,
+                    conditional_dict=conditional_dict,
+                    return_samples=visualize,
+                    backward_callback=_backward_sub_loss,
+                )
+        else:
+            loss, log_dict = self.ode_model.generator_loss(
+                video_latent=video_latent,
+                conditional_dict=conditional_dict,
+                audio_latent=audio_latent,
+                sigmas=sigmas,
+                return_samples=visualize,
+            )
 
         # Gather losses for logging
         unnormalized_loss = log_dict["unnormalized_loss"]
@@ -1343,26 +1469,15 @@ class ODETrainer:
         for t_bucket, losses in loss_breakdown.items():
             stats[f"loss_at_time_{t_bucket}"] = sum(losses) / len(losses)
 
-        # Backward pass with gradient accumulation.
-        # Accumulate gradients over gradient_accumulation_steps micro-batches
-        # before applying an optimizer step. Loss is scaled by 1/accum_steps
-        # so the effective gradient equals the mean over all micro-batches.
-        accum_steps = self.gradient_accumulation_steps
-        is_first_micro = (self.step % accum_steps == 0)
-        is_last_micro = ((self.step + 1) % accum_steps == 0)
-
-        if is_first_micro:
-            self.optimizer.zero_grad()
-
-        scaled_loss = loss / accum_steps
-
-        # Use no_sync() on intermediate micro-batches to skip redundant
-        # FSDP all-reduce. Only the last micro-batch triggers gradient sync.
-        if not is_last_micro and hasattr(self.ode_model._generator, 'no_sync'):
-            with self.ode_model._generator.no_sync():
+        # Offline mode owns one graph for the whole batch. On-policy mode has
+        # already called the callback once per block/denoising transition.
+        if not on_policy:
+            scaled_loss = loss / accum_steps
+            if not is_last_micro and hasattr(self.ode_model._generator, 'no_sync'):
+                with self.ode_model._generator.no_sync():
+                    scaled_loss.backward()
+            else:
                 scaled_loss.backward()
-        else:
-            scaled_loss.backward()
 
         # === Deep diagnostics: rank 0 only, write to log file ===
         should_diag = self.is_main_process and (self.step < 10 or self.step % 50 == 0)
